@@ -1,0 +1,221 @@
+"""
+zoho_detail_probe.py
+────────────────────────────────────────────────────────────────────────────
+Fetches ONE record's full detail from Zoho Creator and prints every field,
+with special focus on finding the Chemical and Dye sub-form line items.
+
+We already know from the raw JSON:
+  - Sub-form field names are likely "Total_Chemical_Cost" and "Dye_Cost"
+    (or similar) but they are empty in the report response.
+  - This script hits /report/{ID} directly to see if the line items appear.
+
+Usage:
+    pip install requests
+    python zoho_detail_probe.py
+
+Reads credentials from .streamlit/secrets.toml automatically.
+────────────────────────────────────────────────────────────────────────────
+"""
+
+import json, re, sys, requests
+from datetime import datetime
+
+# ── Read secrets.toml ────────────────────────────────────────────────────────
+def load_secrets(path=".streamlit/secrets.toml"):
+    secrets, section = {}, None
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            m = re.match(r'^\[([^\]]+)\]$', line)
+            if m:
+                section = m.group(1).strip()
+                secrets[section] = {}
+                continue
+            m = re.match(r'^([\w]+)\s*=\s*"([^"]*)"', line)
+            if m and section:
+                secrets[section][m.group(1)] = m.group(2)
+    except FileNotFoundError:
+        print(f"❌  {path} not found — run from project root"); sys.exit(1)
+    return secrets
+
+cfg = load_secrets().get("zoho_creator", {})
+if not cfg:
+    print("❌  No [zoho_creator] section in secrets.toml"); sys.exit(1)
+
+BASE = f"https://creator.zoho.com/api/v2/{cfg['account_owner']}/{cfg['app_name']}/report/{cfg['report_name']}"
+
+# ── Token ────────────────────────────────────────────────────────────────────
+def get_token():
+    r = requests.post("https://accounts.zoho.com/oauth/v2/token", params={
+        "refresh_token": cfg["refresh_token"],
+        "client_id":     cfg["client_id"],
+        "client_secret": cfg["client_secret"],
+        "grant_type":    "refresh_token",
+    }, timeout=15)
+    r.raise_for_status()
+    d = r.json()
+    if "access_token" not in d:
+        raise RuntimeError(f"Token error: {d}")
+    return d["access_token"]
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def dv(v):
+    if isinstance(v, dict):
+        return v.get("display_value") or v.get("value") or v
+    return v
+
+KNOWN_SUBFORM_NAMES = [
+    # Add any names you see in Zoho form builder here
+    "Total_Chemical_Cost", "Chemical_Cost", "Chemicals", "Chemical_Sub_Form",
+    "Dye_Cost", "Dyes", "Dye_Sub_Form", "Total_Dye_Cost",
+]
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+print("=" * 65)
+print("  Zoho Per-Record Detail Probe")
+print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 65)
+
+token   = get_token()
+headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+print("✅  Token OK")
+
+# Step 1: fetch a few records to get their IDs
+print(f"\n[1] Fetching 10 records from report to get IDs …")
+r = requests.get(BASE, headers=headers,
+                 params={"from": 0, "limit": 10, "field_config": "all"}, timeout=20)
+r.raise_for_status()
+records = r.json().get("data", [])
+print(f"    Got {len(records)} records")
+
+# Pick a record that has a non-zero Total_Cost if possible (more likely to have sub-form data)
+target = None
+for rec in records:
+    tc = rec.get("Total_Cost", "0") or "0"
+    try:
+        if float(str(tc).replace(",","")) > 0:
+            target = rec
+            break
+    except: pass
+if target is None:
+    target = records[0] if records else None
+
+if not target:
+    print("❌  No records found"); sys.exit(1)
+
+rid = target.get("ID") or target.get("id")
+print(f"\n    Chosen record ID: {rid}")
+print(f"    LOT_NO         : {dv(target.get('LOT_NO','?'))}")
+print(f"    Total_Cost     : {dv(target.get('Total_Cost','?'))}")
+print(f"    Total_Chem_Cost: {dv(target.get('Total_Chemical_Cost1', target.get('Total_Chemical_Cost','?')))}")
+print(f"    Total_Dye_Cost : {dv(target.get('Total_Dye_Cost','?'))}")
+
+# Step 2: fetch per-record detail
+print(f"\n[2] Fetching detail for record {rid} …")
+r2 = requests.get(f"{BASE}/{rid}", headers=headers,
+                  params={"field_config": "all"}, timeout=20)
+r2.raise_for_status()
+detail = r2.json().get("data", {})
+print(f"    Total fields in detail: {len(detail)}")
+
+# Save full detail
+with open("zoho_detail_one_record.json", "w") as f:
+    json.dump(detail, f, indent=2, default=str)
+print("    Saved → zoho_detail_one_record.json")
+
+# Step 3: classify all fields
+print("\n[3] Field-by-field breakdown:")
+print("-" * 65)
+
+list_fields   = {}
+scalar_fields = {}
+
+for k, v in detail.items():
+    if isinstance(v, list):
+        list_fields[k] = v
+    else:
+        scalar_fields[k] = v
+
+print(f"\n  SCALAR fields ({len(scalar_fields)}):")
+for k, v in scalar_fields.items():
+    print(f"    {k:45s} = {str(dv(v))[:60]}")
+
+print(f"\n  LIST / SUB-FORM fields ({len(list_fields)}):")
+if not list_fields:
+    print("    ❌  NONE — sub-form line items are NOT in the per-record detail either.")
+    print()
+    print("  ════════════════════════════════════════════════════════════")
+    print("  CONCLUSION: Sub-form data is NOT accessible via the current")
+    print("  report API — even with field_config=all + per-record detail.")
+    print()
+    print("  REQUIRED ACTION:")
+    print("  In Zoho Creator, go to your app → Reports → New Report")
+    print("  1. Create 'Chemical_Lines_Report':")
+    print("     Source form = Production Entry → section = Total Chemical Cost")
+    print("     Columns: Chemical, Quantity_in_grams, Rate_per_Kg, Cost, Percentage")
+    print("     + a Lookup column pointing back to the parent production entry ID")
+    print("  2. Create 'Dye_Lines_Report' the same way for Dye Cost sub-form")
+    print("  3. Add to secrets.toml:")
+    print('     chem_report_name = "Chemical_Lines_Report"')
+    print('     dye_report_name  = "Dye_Lines_Report"')
+    print("  ════════════════════════════════════════════════════════════")
+else:
+    for k, v in list_fields.items():
+        print(f"\n    Field: '{k}'  ({len(v)} row(s))")
+        if not v:
+            print("      (empty list)")
+            continue
+        first = v[0]
+        if not isinstance(first, dict):
+            print(f"      items are not dicts: {v[:2]}")
+            continue
+        # Check if expanded or collapsed
+        zc = first.get("zc_display_value")
+        meaningful = [kk for kk in first.keys()
+                      if kk not in ("display_value","ID","zc_display_value","id")]
+        if meaningful:
+            print(f"      ✅  EXPANDED — keys: {list(first.keys())}")
+            for row_i, row in enumerate(v[:3]):
+                flat = {}
+                if isinstance(row.get("zc_display_value"), dict):
+                    flat = {kk: dv(vv) for kk, vv in row["zc_display_value"].items()}
+                else:
+                    flat = {kk: dv(vv) for kk, vv in row.items()
+                            if kk not in ("display_value","zc_display_value")}
+                print(f"      Row {row_i+1}: {json.dumps(flat, default=str)}")
+        elif isinstance(zc, dict) and zc:
+            print(f"      ⚠️  COLLAPSED — zc_display_value keys: {list(zc.keys())}")
+            print(f"      Row 1 display: {json.dumps(zc, default=str)[:200]}")
+        else:
+            print(f"      ⚠️  Only ID+display_value stub: {first}")
+
+# Step 4: check if we need separate reports
+print("\n[4] Checking for separate sub-form reports in secrets.toml …")
+chem_report = cfg.get("chem_report_name", "")
+dye_report  = cfg.get("dye_report_name", "")
+
+for label, rname in [("Chemical", chem_report), ("Dye", dye_report)]:
+    if not rname:
+        print(f"    {label}: ⏭️  Not configured")
+        continue
+    rurl = f"https://creator.zoho.com/api/v2/{cfg['account_owner']}/{cfg['app_name']}/report/{rname}"
+    try:
+        rr = requests.get(rurl, headers=headers,
+                          params={"from": 0, "limit": 3, "field_config": "all"}, timeout=15)
+        rr.raise_for_status()
+        recs = rr.json().get("data", [])
+        if recs:
+            print(f"    {label}: ✅  {len(recs)} row(s) — columns: {list(recs[0].keys())}")
+            print(f"      Sample: {json.dumps({k: dv(v) for k, v in list(recs[0].items())[:6]}, default=str)}")
+            with open(f"zoho_{label.lower()}_subform_sample.json", "w") as f:
+                json.dump(recs, f, indent=2, default=str)
+            print(f"      Saved → zoho_{label.lower()}_subform_sample.json")
+        else:
+            print(f"    {label}: ⚠️  Report exists but 0 rows")
+    except Exception as e:
+        print(f"    {label}: ❌  {e}")
+
+print("\n" + "=" * 65)
+print("  Done. Share the output above and zoho_detail_one_record.json")
+print("=" * 65)
