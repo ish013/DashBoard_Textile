@@ -1155,6 +1155,24 @@ def render_chemical_consumption(data, chem):
             text=[fmt_cur(v) for v in g["Cost"].head(15)], textposition="outside", textfont=dict(color="#374151", size=10)))
         apply_layout(fig_chem, "Top Chemicals by Total Cost", height=320, show_legend=False)
         fig_chem.update_xaxes(tickangle=-30, showgrid=False); pc(fig_chem)
+    # ── Chemical distribution pie (by cost/amount share) ──
+    chem_dist = chem.groupby("Item").agg(Uses=("Cost","count"), Cost=("Cost","sum"), Qty=("Quantity_g","sum")).reset_index().sort_values("Cost", ascending=False)
+    top_chem_dist = chem_dist.head(10).copy()
+    others_uses = chem_dist.iloc[10:]["Uses"].sum(); others_cost = chem_dist.iloc[10:]["Cost"].sum(); others_qty = chem_dist.iloc[10:]["Qty"].sum()
+    if others_cost > 0:
+        top_chem_dist = pd.concat([top_chem_dist, pd.DataFrame([{"Item":"Others","Uses":others_uses,"Cost":others_cost,"Qty":others_qty}])], ignore_index=True)
+    top_chem_dist["Weight_kg"] = top_chem_dist["Qty"] / 1000
+    # pre-format the extra hover fields as plain text — Pie traces don't reliably support
+    # multi-column customdata[i] indexing in hovertemplate, so build the string in Python instead.
+    hover_extra = [f"Uses: {int(u)}<br>Cost: {fmt_cur(c)}<br>Weight Consumed: {w:,.2f} kg"
+                   for u, c, w in zip(top_chem_dist["Uses"], top_chem_dist["Cost"], top_chem_dist["Weight_kg"])]
+    fig_chem_pie = go.Figure(go.Pie(labels=top_chem_dist["Item"], values=top_chem_dist["Cost"], hole=0.52,
+        marker=dict(colors=PALETTE[:len(top_chem_dist)], line=dict(color="#ffffff", width=2)),
+        textinfo="label+percent", textfont=dict(size=11, color="#374151"),
+        customdata=hover_extra,
+        hovertemplate="<b>%{label}</b><br>Share: %{percent}<br>%{customdata}<extra></extra>"))
+    apply_layout(fig_chem_pie, "Chemical Distribution (by Cost Share)", height=320)
+    pc(fig_chem_pie)
     # Quality × chemical cost heatmap
     if "QUALITY" in chem.columns:
         top_items = g["Item"].head(8).tolist()
@@ -1254,7 +1272,7 @@ def render_business_insights(data, chem, dye, scope_label=""):
 # ═══════════════════════════════════════════════════════════
 # NEW COST SECTIONS
 # ═══════════════════════════════════════════════════════════
-def render_cost_overview(data):
+def render_cost_overview(data, chem=None, dye=None):
     if not HAS_COST:
         st.info("ℹ️ Cost data not available yet — once Total Cost / Dye / Chemical costs flow in, this section activates."); return
     section_header("💰", "Cost Overview", "Total spend, unit economics and dye-vs-chemical split")
@@ -1300,8 +1318,8 @@ def render_cost_overview(data):
                 text=[f"₹{v:.2f}" for v in party_ck["Cost/KG"]], textposition="outside", textfont=dict(color="#374151", size=10, family="JetBrains Mono")))
             apply_layout(fig_pk, "Cost per KG by Party", height=300, show_legend=False)
             fig_pk.update_yaxes(showgrid=False); pc(fig_pk)
-    # cost/kg by party + quality
-    c3, c4 = st.columns(2)
+    # cost/kg by party + quality + shade
+    c3, c4, c5 = st.columns(3)
     with c3:
         pk = data.groupby("Party Name").agg(Cost=("Total Cost","sum"), Weight=("Weight","sum")).reset_index()
         pk["Cost/KG"] = (pk["Cost"] / pk["Weight"].replace(0, pd.NA)).round(2)
@@ -1322,6 +1340,55 @@ def render_cost_overview(data):
             text=[f"₹{v:.1f}" for v in qk["Cost/KG"]], textposition="outside", textfont=dict(color="#374151", size=10, family="JetBrains Mono")))
         apply_layout(fig, "Cost/KG by Quality", height=320, show_legend=False)
         fig.update_xaxes(tickangle=-30, showgrid=False); pc(fig)
+    with c5:
+        sk = data.groupby("SHADE").agg(Cost=("Total Cost","sum"), Weight=("Weight","sum")).reset_index()
+        sk["Cost/KG"] = (sk["Cost"] / sk["Weight"].replace(0, pd.NA)).round(2)
+        sk = sk.sort_values("Cost/KG", ascending=False).head(12)
+        fig = go.Figure(go.Bar(x=sk["SHADE"], y=sk["Cost/KG"],
+            marker=dict(color=list(range(len(sk))), colorscale="Purpor", showscale=False, line=dict(width=0)),
+            text=[f"₹{v:.1f}" for v in sk["Cost/KG"]], textposition="outside", textfont=dict(color="#374151", size=10, family="JetBrains Mono")))
+        apply_layout(fig, "Cost/KG by Shade", height=320, show_legend=False)
+        fig.update_xaxes(tickangle=-30, showgrid=False); pc(fig)
+
+    # ── Combined Chemical + Dye item-level cost distribution ──
+    if (chem is not None and not chem.empty) or (dye is not None and not dye.empty):
+        section_divider("🧪🧴 Combined Chemical + Dye Cost Distribution")
+        combined_rows = []
+        if chem is not None and not chem.empty:
+            cg = chem.groupby("Item").agg(Cost=("Cost","sum"), Qty=("Quantity_g","sum"), Uses=("Cost","count")).reset_index()
+            cg["Type"] = "Chemical"
+            combined_rows.append(cg)
+        if dye is not None and not dye.empty:
+            dg = dye.groupby("Item").agg(Cost=("Cost","sum"), Qty=("Quantity_g","sum"), Uses=("Cost","count")).reset_index()
+            dg["Type"] = "Dye"
+            combined_rows.append(dg)
+        comb = pd.concat(combined_rows, ignore_index=True)
+        # disambiguate items that share the same name across chemical & dye
+        comb["Label"] = comb["Item"] + " (" + comb["Type"].str[:4] + ")"
+        comb = comb.sort_values("Cost", ascending=False).reset_index(drop=True)
+        top_comb = comb.head(15).copy()
+        others_comb = comb.iloc[15:]
+        if not others_comb.empty and others_comb["Cost"].sum() > 0:
+            top_comb = pd.concat([top_comb, pd.DataFrame([{
+                "Item": "Others", "Cost": others_comb["Cost"].sum(), "Qty": others_comb["Qty"].sum(),
+                "Uses": others_comb["Uses"].sum(), "Type": "Mixed", "Label": "Others"}])], ignore_index=True)
+        top_comb["Weight_kg"] = top_comb["Qty"] / 1000
+        hover_extra_comb = [f"Type: {t}<br>Uses: {int(u)}<br>Cost: {fmt_cur(c)}<br>Weight Consumed: {w:,.2f} kg"
+                             for t, u, c, w in zip(top_comb["Type"], top_comb["Uses"], top_comb["Cost"], top_comb["Weight_kg"])]
+        combined_palette = ["#06b6d4" if t == "Chemical" else ("#8b5cf6" if t == "Dye" else "#9ca3af") for t in top_comb["Type"]]
+        fig_comb = go.Figure(go.Pie(labels=top_comb["Label"], values=top_comb["Cost"], hole=0.5,
+            marker=dict(colors=combined_palette, line=dict(color="#ffffff", width=2)),
+            textinfo="label+percent", textfont=dict(size=10, color="#374151"),
+            customdata=hover_extra_comb,
+            hovertemplate="<b>%{label}</b><br>Share: %{percent}<br>%{customdata}<extra></extra>"))
+        apply_layout(fig_comb, "All Chemicals + Dyes — Combined Cost Share", height=420)
+        pc(fig_comb)
+        tot_chem_spend = comb.loc[comb["Type"]=="Chemical","Cost"].sum()
+        tot_dye_spend  = comb.loc[comb["Type"]=="Dye","Cost"].sum()
+        grand_total = tot_chem_spend + tot_dye_spend
+        if grand_total:
+            top_item = comb.iloc[0]
+            insight_card(f"<strong>{top_item['Item']}</strong> ({top_item['Type']}) is the single biggest line-item across both chemicals and dyes combined — {top_item['Cost']/grand_total*100:.1f}% of total chemical+dye spend ({fmt_cur(top_item['Cost'])}).", kind="info")
 
 
 def render_dye_cost(data, dye):
@@ -1359,6 +1426,23 @@ def render_dye_cost(data, dye):
             badge = ["🥇","🥈","🥉"][i] if i < 3 else f"#{i+1}"
             rows += f"<tr><td>{badge}</td><td>{r['Item']}</td><td>{fmt_cur(r['Cost'])}</td><td>₹{r['AvgRate']:.1f}</td><td>{r['Share %']:.1f}%</td></tr>"
         st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;max-height:360px;overflow-y:auto;"><table class="leaderboard-table"><thead><tr><th>Rank</th><th>Dye</th><th>Cost</th><th>Avg Rate/Kg</th><th>Share</th></tr></thead><tbody>{rows}</tbody></table></div>""", unsafe_allow_html=True)
+    # ── Dye distribution pie (by cost/amount share), mirrors Chemical Distribution ──
+    top_dye_dist = g.head(10).copy()
+    others = g.iloc[10:]
+    if not others.empty and others["Cost"].sum() > 0:
+        top_dye_dist = pd.concat([top_dye_dist, pd.DataFrame([{
+            "Item": "Others", "Cost": others["Cost"].sum(), "Qty": others["Qty"].sum(),
+            "AvgRate": others["AvgRate"].mean(), "Uses": others["Uses"].sum()}])], ignore_index=True)
+    top_dye_dist["Weight_kg"] = top_dye_dist["Qty"] / 1000
+    hover_extra_dye = [f"Uses: {int(u)}<br>Cost: {fmt_cur(c)}<br>Weight Consumed: {w:,.2f} kg"
+                        for u, c, w in zip(top_dye_dist["Uses"], top_dye_dist["Cost"], top_dye_dist["Weight_kg"])]
+    fig_dye_pie = go.Figure(go.Pie(labels=top_dye_dist["Item"], values=top_dye_dist["Cost"], hole=0.52,
+        marker=dict(colors=PALETTE[:len(top_dye_dist)], line=dict(color="#ffffff", width=2)),
+        textinfo="label+percent", textfont=dict(size=11, color="#374151"),
+        customdata=hover_extra_dye,
+        hovertemplate="<b>%{label}</b><br>Share: %{percent}<br>%{customdata}<extra></extra>"))
+    apply_layout(fig_dye_pie, "Dye Distribution (by Cost Share)", height=320)
+    pc(fig_dye_pie)
     # dye usage by shade
     if "SHADE" in dye.columns:
         top_dyes = g["Item"].head(8).tolist()
@@ -1453,7 +1537,11 @@ def render_cost_flag_table(data):
 
     d = d.sort_values(["Business Type", "Production Date"])
 
-    # same column set as the Day-view Production Sheet, plus Total Cost Amount at the end
+    # share % — each lot's weight as a % of the total weight of this flagged table
+    total_flag_weight = d["Weight"].sum()
+    d["Share %"] = (d["Weight"] / total_flag_weight * 100).round(2) if total_flag_weight else 0
+
+    # same column set as the Day-view Production Sheet, plus Share % and Total Cost Amount at the end
     cost_cols = [c for c in ["Total Dye Cost", "Total Chemical Cost", "Total Cost"] if c in d.columns]
     display_cols = (["LOT NO.", "Party Name", "QUALITY", "SHADE", "SIZE", "M.No.", "MTRS", "Weight"]
                      + cost_cols + ["Business Type", "MASTER NAME"])
@@ -1461,7 +1549,7 @@ def render_cost_flag_table(data):
     money_cols = {"Total Dye Cost", "Total Chemical Cost", "Total Cost"}
     num_cols = {"MTRS", "Weight"}
 
-    headers_html = "".join(f"<th>{c}</th>" for c in display_cols) + "<th>Total Cost Amount</th>"
+    headers_html = "".join(f"<th>{c}</th>" for c in display_cols) + "<th>Share %</th><th>Total Cost Amount</th>"
     rows = ""
     for _, r in d.iterrows():
         cells = ""
@@ -1472,6 +1560,7 @@ def render_cost_flag_table(data):
                 cells += f"<td>{fmt_cur(r[col])}</td>"
             else:
                 cells += f"<td>{r[col]}</td>"
+        cells += f"<td>{r['Share %']:.2f}%</td>"
         val = r["Total Cost Amount"]
         badge, style = _flag(val)
         cells += f"<td style='{style}'>{val:.2f} {badge}</td>"
@@ -1501,7 +1590,7 @@ def render_cost_block(scope_df, scope_chem, scope_dye, scope_label=""):
     section_divider("💰 Cost & Profitability Analysis")
     cost_tabs = st.tabs(["💰 Overview", "🧴 Dye Costs", "🧬 Recipe Consistency",
                          "🏷️ Business Type", "🚦 Cost Flags"])
-    with cost_tabs[0]: render_cost_overview(scope_df)
+    with cost_tabs[0]: render_cost_overview(scope_df, scope_chem, scope_dye)
     with cost_tabs[1]: render_dye_cost(scope_df, scope_dye)
     with cost_tabs[2]: render_recipe_consistency(scope_df)
     with cost_tabs[3]: render_business_type(scope_df)
