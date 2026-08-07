@@ -12,6 +12,12 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 AUTO_REFRESH_SEC = 60
 
+# Rates in the Chemical/Dye Rate History sheets don't change minute-to-minute, so
+# the (comparatively expensive) rate-correction + re-aggregation pass is cached on
+# its own, much longer interval — independent of the 60s production-data refresh.
+# Bump this if you want corrections to reflect rate-history edits sooner/later.
+RATE_REFRESH_SEC = 900  # 15 minutes
+
 st.set_page_config(
     page_title="Dyeing Operations Dashboard",
     page_icon="🎨",
@@ -21,11 +27,13 @@ st.set_page_config(
 
 # Real auto-refresh (the old <script> tag was stripped by Streamlit and never ran).
 # pip install streamlit-autorefresh  — degrades gracefully if not installed.
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=AUTO_REFRESH_SEC * 1000, key="auto_refresh_tick")
-except Exception:
-    pass
+# try:
+#     from streamlit_autorefresh import st_autorefresh
+#     st_autorefresh(interval=AUTO_REFRESH_SEC * 1000, key="auto_refresh_tick")
+# except Exception:
+#     pass
+
+
 
 # ─────────────────────────────────────────────
 # CSS  (original kept verbatim + a few cost classes)
@@ -164,6 +172,17 @@ h2, h3 { color:#111827 !important;font-weight:700 !important; }
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
+# PARTY NAME MERGES  (old name → merged display name)
+# Add more entries here anytime two parties should be combined into one.
+# Matching is exact (after whitespace trim) against the "Party Name" field
+# coming from Zoho, so make sure the left-hand keys match Zoho's spelling.
+# ─────────────────────────────────────────────
+PARTY_MERGE_MAP = {
+    "Arven Tex Fab": "Arven Tex Fab /Variety",
+    "Variety": "Arven Tex Fab /Variety",
+}
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 def fmt_in(n):
@@ -299,9 +318,9 @@ def render_executive_snapshot(data, full=None, label=""):
         cls = "risk" if top_pct > 40 else ("warn" if top_pct > 30 else "ok")
         chips.append((cls, f"🏭 Top party {top_p}: {top_pct:.0f}% of volume"))
     if lots:
-        sp = (data["Weight"] < 100).sum() / lots * 100
+        sp = (data["Weight"] < 200).sum() / lots * 100
         cls = "risk" if sp > 30 else ("warn" if sp > 15 else "ok")
-        chips.append((cls, f"📦 Small lots (&lt;100 kg): {sp:.0f}%"))
+        chips.append((cls, f"📦 Small lots (&lt;200 kg): {sp:.0f}%"))
     if "Total Cost Amount" in data.columns and data["Total Cost Amount"].sum() > 0:
         tt = data[data["Business Type"].isin(["Airmesh", "Towel", "Thin Quality"])]
         if not tt.empty:
@@ -537,7 +556,141 @@ def _load_subform_details(record_ids, detail_cap=1500):
     return chem_rows, dye_rows
 
 
-@st.cache_data(ttl=AUTO_REFRESH_SEC, show_spinner="Loading production data…")
+@st.cache_data(ttl=900, show_spinner="Loading chemical & dye rate history…")
+def _load_rate_history(report_name, lookup_field):
+    """Fetch an SCD-2 rate-history report (Chemical_Rate_History_Report /
+    Dye_Rate_History_Report) and build:  name -> [(effective_from, effective_to, rate), ...]
+    Matching downstream is done by trimmed item NAME (not internal ID) — the lines
+    report only exposes display-value names, and both sides draw from the same
+    lookup master, so name matching is safe and avoids a second ID-fetch round trip.
+    If two ranges genuinely overlap for the same item, the row with the LATEST
+    Effective_From wins (most recently entered correction takes precedence)."""
+    cfg   = st.secrets["zoho_creator"]
+    owner = cfg["account_owner"]; app = cfg["app_name"]
+    token = get_access_token()
+    base_url = f"https://creator.zoho.in/api/v2/{owner}/{app}/report/{report_name}"
+    headers  = {"Authorization": f"Zoho-oauthtoken {token}"}
+    rate_map = {}
+    start = 0; limit = 200
+    while True:
+        try:
+            resp = requests.get(base_url, headers=headers,
+                                params={"from": start, "limit": limit, "field_config": "all"}, timeout=25)
+            resp.raise_for_status()
+        except Exception:
+            break
+        recs = resp.json().get("data", [])
+        if not recs:
+            break
+        for rec in recs:
+            name = dv(rec.get(lookup_field))
+            if isinstance(name, dict):
+                name = dv(name)
+            name = str(name).strip()
+            rate = _to_num(dv(rec.get("Rate_per_Kg")))
+            eff_from = parse_dates(pd.Series([str(dv(rec.get("Effective_From")))])).iloc[0]
+            eff_to   = parse_dates(pd.Series([str(dv(rec.get("Effective_To")))])).iloc[0]
+            if name and rate > 0:
+                rate_map.setdefault(name, []).append((eff_from, eff_to, rate))
+        if len(recs) < limit:
+            break
+        start += limit
+    # sort each item's ranges by Effective_From ascending so "latest wins" is a simple
+    # last-match-in-loop pick when ranges overlap
+    for name in rate_map:
+        rate_map[name].sort(key=lambda t: (t[0] if pd.notna(t[0]) else pd.Timestamp.min))
+    return rate_map
+
+
+def _rate_on_date(rate_map, name, date):
+    """Return the correct Rate_per_Kg for `name` effective on `date`, or 0 if no match.
+    When multiple ranges cover the same date (overlap / data-entry mistake in the
+    rate-history sheet), the range with the latest Effective_From wins."""
+    ranges = rate_map.get(str(name).strip())
+    if not ranges or pd.isna(date):
+        return 0.0
+    best_rate, best_from = 0.0, None
+    for eff_from, eff_to, rate in ranges:
+        if pd.isna(eff_from) or pd.isna(eff_to):
+            continue
+        if eff_from <= date <= eff_to:
+            if best_from is None or eff_from > best_from:
+                best_rate, best_from = rate, eff_from
+    return best_rate
+
+
+@st.cache_data(ttl=RATE_REFRESH_SEC, show_spinner="Applying SCD-2 rate corrections…")
+def _apply_scd2_rate_corrections(df, df_chem, df_dye):
+    """Operators sometimes enter a lot before the rate-history sheet is updated,
+    so the rate/cost stored on each chemical/dye line-item can be stale. Here we
+    look up the rate that was actually EFFECTIVE on that lot's Production Date
+    from the Chemical/Dye Rate History reports, recompute Cost & Percentage on
+    every line-item, then re-aggregate up into the parent lot's Total Chemical
+    Cost / Total Dye Cost / Total Cost / % fields — the same correction the
+    Fix_All_Costs() Deluge function does, just applied live at read time so it
+    never goes stale again and fixes the sub-form line-items too (which
+    Fix_All_Costs() could not reach). If no rate-history match is found for an
+    item/date, the originally-stored rate/cost is kept as a fallback rather than
+    zeroing it out.
+
+    Cached on its own RATE_REFRESH_SEC interval (independent of the 60s production
+    data refresh) since rate-history edits don't happen minute-to-minute — this
+    keeps the correction pass from re-running on every single auto-refresh tick."""
+    try:
+        chem_rate_map = _load_rate_history("Chemical_Rate_History_Report", "Chemical_Lookup")
+        dye_rate_map  = _load_rate_history("Dye_Rate_History_Report", "Dye_Lookup")
+    except Exception:
+        chem_rate_map, dye_rate_map = {}, {}
+
+    def _apply_rate_correction(sub, rate_map):
+        if sub.empty or "Quantity_g" not in sub.columns or "Production Date" not in sub.columns:
+            return sub
+        sub = sub.copy()
+        corrected_rate = sub.apply(
+            lambda r: _rate_on_date(rate_map, r.get("Item", ""), r.get("Production Date")), axis=1)
+        # fall back to the originally-stored rate when no rate-history match exists
+        sub["Rate_per_Kg"] = corrected_rate.where(corrected_rate > 0, sub["Rate_per_Kg"])
+        sub["Cost"] = (sub["Quantity_g"] / 1000.0) * sub["Rate_per_Kg"]
+        wt = pd.to_numeric(sub.get("Weight", 0), errors="coerce").fillna(0)
+        sub["Percentage"] = 0.0
+        mask = wt > 0
+        sub.loc[mask, "Percentage"] = (sub.loc[mask, "Quantity_g"] / 1000.0) / wt[mask] * 100
+        return sub
+
+    if chem_rate_map:
+        df_chem = _apply_rate_correction(df_chem, chem_rate_map)
+    if dye_rate_map:
+        df_dye = _apply_rate_correction(df_dye, dye_rate_map)
+
+    df = df.copy()
+    if not df.empty:
+        if not df_chem.empty and "_parent" in df_chem.columns:
+            c_agg = df_chem.groupby("_parent").agg(
+                _cc=("Cost", "sum"), _cp=("Percentage", "sum")).reset_index()
+            df = df.merge(c_agg, left_on="_id", right_on="_parent", how="left", suffixes=("", "_cagg"))
+            df["Total Chemical Cost"] = df["_cc"].fillna(df["Total Chemical Cost"]).round(2)
+            df["Total Chemical %"]    = df["_cp"].fillna(df["Total Chemical %"]).round(2)
+            df.drop(columns=[c for c in ["_cc", "_cp", "_parent"] if c in df.columns], inplace=True)
+        if not df_dye.empty and "_parent" in df_dye.columns:
+            d_agg = df_dye.groupby("_parent").agg(
+                _dc=("Cost", "sum"), _dp=("Percentage", "sum")).reset_index()
+            df = df.merge(d_agg, left_on="_id", right_on="_parent", how="left", suffixes=("", "_dagg"))
+            df["Total Dye Cost"] = df["_dc"].fillna(df["Total Dye Cost"]).round(2)
+            df["Total Dye %"]    = df["_dp"].fillna(df["Total Dye %"]).round(2)
+            df.drop(columns=[c for c in ["_dc", "_dp", "_parent"] if c in df.columns], inplace=True)
+        df["Total Cost"] = (df["Total Chemical Cost"] + df["Total Dye Cost"]).round(2)
+        # Total_Cost_Amount = Total Cost per KG (verified against sample record: 1656.44 / 301 ≈ 5.5)
+        wt_all = pd.to_numeric(df["Weight"], errors="coerce").fillna(0)
+        df["Total Cost Amount"] = 0.0
+        mwt = wt_all > 0
+        df.loc[mwt, "Total Cost Amount"] = (df.loc[mwt, "Total Cost"] / wt_all[mwt]).round(2)
+
+    return df, df_chem, df_dye
+
+
+# @st.cache_data(ttl=AUTO_REFRESH_SEC, show_spinner="Loading production data…")
+# def load_data():
+@st.cache_data(show_spinner="Loading production data…")
 def load_data():
     cfg          = st.secrets["zoho_creator"]
     owner        = cfg["account_owner"]      # e.g. fibernomad
@@ -680,6 +833,10 @@ def load_data():
         else:
             df[col] = "Unknown"
 
+    # merge party names that should be treated as a single party (see PARTY_MERGE_MAP above)
+    if "Party Name" in df.columns:
+        df["Party Name"] = df["Party Name"].replace(PARTY_MERGE_MAP)
+
     failed = df["Production Date"].isna().sum()
     df = df.dropna(subset=["Production Date"])
     df = df[df["Party Name"].str.strip().ne("")]
@@ -715,6 +872,8 @@ def load_data():
             df_chem = df_chem.merge(dims, left_on="_parent", right_on="_id", how="left")
         if not df_dye.empty:
             df_dye = df_dye.merge(dims, left_on="_parent", right_on="_id", how="left")
+
+    df, df_chem, df_dye = _apply_scd2_rate_corrections(df, df_chem, df_dye)
 
     return df, df_chem, df_dye, datetime.now(), failed, diag
 
@@ -825,31 +984,41 @@ all_biztypes = sorted(raw["Business Type"].dropna().unique())
 
 with st.expander("🔍  Filters — click to expand", expanded=False):
     st.markdown("<div class='filter-bar-title'>Filter the data below</div>", unsafe_allow_html=True)
+
+    # Versioned widget keys: bumping this counter on "Reset All" forces Streamlit to
+    # throw away the old multiselect/date-input components and mount brand-new ones
+    # with clean defaults, instead of reusing the same key (which can leave the
+    # on-screen pills showing stale selections even though the underlying data reset).
+    if "filter_reset_ctr" not in st.session_state:
+        st.session_state["filter_reset_ctr"] = 0
+    _rv = st.session_state["filter_reset_ctr"]
+
     fc1, fc2, fc3, fc4, fc5 = st.columns([2, 2, 2, 2, 2])
     with fc1:
         st.markdown("**📅 Date Range**")
         date_range = st.date_input("date_range", value=(min_date, max_date),
-            min_value=min_date, max_value=max_date, label_visibility="collapsed")
+            min_value=min_date, max_value=max_date, label_visibility="collapsed", key=f"filter_date_range_{_rv}")
     with fc2:
         st.markdown("**🏭 Party**")
-        sel_parties = st.multiselect("Party", all_parties, default=all_parties, label_visibility="collapsed")
+        sel_parties = st.multiselect("Party", all_parties, default=all_parties, label_visibility="collapsed", key=f"filter_parties_{_rv}")
     with fc3:
         st.markdown("**🧵 Quality**")
-        sel_quality = st.multiselect("Quality", all_quality, default=all_quality, label_visibility="collapsed")
+        sel_quality = st.multiselect("Quality", all_quality, default=all_quality, label_visibility="collapsed", key=f"filter_quality_{_rv}")
     with fc4:
         st.markdown("**🎨 Shade**")
-        sel_shades = st.multiselect("Shade", all_shades, default=all_shades, label_visibility="collapsed")
+        sel_shades = st.multiselect("Shade", all_shades, default=all_shades, label_visibility="collapsed", key=f"filter_shades_{_rv}")
     with fc5:
         st.markdown("**👤 Master**")
-        sel_masters = st.multiselect("Master", all_masters, default=all_masters, label_visibility="collapsed")
+        sel_masters = st.multiselect("Master", all_masters, default=all_masters, label_visibility="collapsed", key=f"filter_masters_{_rv}")
 
     fb1, fb2, fb3 = st.columns([2, 6, 1])
     with fb1:
         st.markdown("**🏷️ Business Type**")
-        sel_biztypes = st.multiselect("Business Type", all_biztypes, default=all_biztypes, label_visibility="collapsed")
+        sel_biztypes = st.multiselect("Business Type", all_biztypes, default=all_biztypes, label_visibility="collapsed", key=f"filter_biztypes_{_rv}")
     with fb3:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         if st.button("↩️ Reset All", use_container_width=True):
+            st.session_state["filter_reset_ctr"] += 1
             st.rerun()
 
 # status strip
@@ -886,15 +1055,25 @@ df_dye  = subset_sub(df, raw_dye)
 # VIEW TOGGLE
 # ─────────────────────────────────────────────
 st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-vt_col1, vt_col2, vt_spacer = st.columns([1, 1, 5])
+vt_col1, vt_col2, vt_col3, vt_spacer = st.columns([1, 1, 1, 4])
 with vt_col1:
     day_btn = st.button("📅  Day Wise", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "day" else "secondary")
 with vt_col2:
     month_btn = st.button("📆  Month Wise", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "month" else "secondary")
-if day_btn:   st.session_state["view"] = "day"
-if month_btn: st.session_state["view"] = "month"
+with vt_col3:
+    ledger_btn = st.button("🧾  Party Ledger", use_container_width=True,
+        type="primary" if st.session_state.get("view", "month") == "ledger" else "secondary")
+if day_btn:
+    st.session_state["view"] = "day"
+    st.rerun()
+if month_btn:
+    st.session_state["view"] = "month"
+    st.rerun()
+if ledger_btn:
+    st.session_state["view"] = "ledger"
+    st.rerun()
 current_view = st.session_state.get("view", "month")
 st.divider()
 
@@ -978,20 +1157,20 @@ def render_master_productivity(data):
 def render_small_lot_analysis(data):
     section_header("📦", "Small Lot Analysis", "Lot size distribution and operational cost risk")
     data = data.copy()
-    data["Lot Size"] = pd.cut(data["Weight"], bins=[-1, 99.99, 300, float("inf")],
-        labels=["Small (<100 kg)", "Medium (100–300 kg)", "Large (>300 kg)"])
-    lot_counts = data["Lot Size"].value_counts().reindex(
-        ["Small (<100 kg)", "Medium (100–300 kg)", "Large (>300 kg)"]).fillna(0).reset_index()
+    cats = ["Small (<200 kg)", "Medium (200–300 kg)", "Large (300–500 kg)", "Extra Large (500+ kg)"]
+    data["Lot Size"] = pd.cut(data["Weight"], bins=[-1, 199.99, 299.99, 499.99, float("inf")],
+        labels=cats)
+    lot_counts = data["Lot Size"].value_counts().reindex(cats).fillna(0).reset_index()
     lot_counts.columns = ["Category", "Count"]
     lot_counts["Pct"] = (lot_counts["Count"] / lot_counts["Count"].sum() * 100).round(1)
-    small_pct = lot_counts.loc[lot_counts["Category"]=="Small (<100 kg)", "Pct"].values
+    small_pct = lot_counts.loc[lot_counts["Category"]=="Small (<200 kg)", "Pct"].values
     small_pct = small_pct[0] if len(small_pct) else 0
-    c1, c2, c3 = st.columns(3)
-    for col, (_, row) in zip([c1, c2, c3], lot_counts.iterrows()):
+    c1, c2, c3, c4 = st.columns(4)
+    for col, (_, row) in zip([c1, c2, c3, c4], lot_counts.iterrows()):
         col.metric(f"{row['Category']}", f"{int(row['Count'])} lots", delta=f"{row['Pct']:.1f}% of total")
     c_chart, c_warn = st.columns([2, 3])
     with c_chart:
-        colors_lot = ["#ef4444", "#f59e0b", "#10b981"]
+        colors_lot = ["#ef4444", "#f59e0b", "#3b82f6", "#10b981"]
         fig_lot = go.Figure(go.Pie(labels=lot_counts["Category"], values=lot_counts["Count"], hole=0.55,
             marker=dict(colors=colors_lot, line=dict(color="#ffffff", width=2)),
             textinfo="label+percent", textfont=dict(size=12, color="#374151")))
@@ -999,21 +1178,21 @@ def render_small_lot_analysis(data):
     with c_warn:
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
         if small_pct >= 40:
-            insight_card(f"<strong>{small_pct:.1f}% of all lots are Small (&lt;100 kg).</strong> Critically high — increases setup time, labour cost/kg, and dye wastage. Consider lot consolidation.", kind="risk")
+            insight_card(f"<strong>{small_pct:.1f}% of all lots are Small (&lt;200 kg).</strong> Critically high — increases setup time, labour cost/kg, and dye wastage. Consider lot consolidation.", kind="risk")
         elif small_pct >= 20:
-            insight_card(f"<strong>{small_pct:.1f}% of lots are Small (&lt;100 kg)</strong> — moderate overhead. Review batching opportunities.", kind="warn")
+            insight_card(f"<strong>{small_pct:.1f}% of lots are Small (&lt;200 kg)</strong> — moderate overhead. Review batching opportunities.", kind="warn")
         else:
             insight_card(f"<strong>Small lot percentage is {small_pct:.1f}%</strong> — within acceptable range.", kind="good")
         if HAS_COST:
-            small_df = data[data["Lot Size"] == "Small (<100 kg)"]
-            big_df   = data[data["Lot Size"] == "Large (>300 kg)"]
+            small_df = data[data["Lot Size"] == "Small (<200 kg)"]
+            big_df   = data[data["Lot Size"] == "Extra Large (500+ kg)"]
             if small_df["Weight"].sum() and big_df["Weight"].sum():
                 ckg_small = small_df["Total Cost"].sum() / small_df["Weight"].sum()
                 ckg_big   = big_df["Total Cost"].sum() / big_df["Weight"].sum()
                 if ckg_big:
                     diff = (ckg_small - ckg_big) / ckg_big * 100
-                    insight_card(f"Small lots cost <strong>₹{ckg_small:.2f}/kg</strong> vs <strong>₹{ckg_big:.2f}/kg</strong> for large lots — <strong>{diff:+.0f}%</strong> difference in processing cost per kg.", kind="info")
-        party_small = (data[data["Lot Size"]=="Small (<100 kg)"].groupby("Party Name").size().reset_index(name="Small Lots").sort_values("Small Lots", ascending=False).head(5))
+                    insight_card(f"Small lots cost <strong>₹{ckg_small:.2f}/kg</strong> vs <strong>₹{ckg_big:.2f}/kg</strong> for extra large lots — <strong>{diff:+.0f}%</strong> difference in processing cost per kg.", kind="info")
+        party_small = (data[data["Lot Size"]=="Small (<200 kg)"].groupby("Party Name").size().reset_index(name="Small Lots").sort_values("Small Lots", ascending=False).head(5))
         if not party_small.empty:
             insight_card("Top parties by small lot count: <strong>" + ", ".join(f"{r['Party Name']} ({int(r['Small Lots'])})" for _, r in party_small.iterrows()) + "</strong>. Negotiate minimum batch sizes with these parties.", kind="info")
 
@@ -1234,9 +1413,9 @@ def render_business_insights(data, chem, dye, scope_label=""):
         for mno, wt in mach_wt.items():
             if avg_mwt and wt < avg_mwt*0.6:
                 insights.append(("warn","⚙️", f"Machine <strong>{mno}</strong> processed <strong>{(1-wt/avg_mwt)*100:.0f}% less</strong> than average. Check for downtime or underallocation."))
-    small_pct = (data["Weight"] < 100).sum() / len(data) * 100 if len(data) else 0
+    small_pct = (data["Weight"] < 200).sum() / len(data) * 100 if len(data) else 0
     if small_pct > 30:
-        insights.append(("risk","📦", f"Small lots (&lt;100 kg) account for <strong>{small_pct:.1f}%</strong> of all lots — increasing cost per kg."))
+        insights.append(("risk","📦", f"Small lots (&lt;200 kg) account for <strong>{small_pct:.1f}%</strong> of all lots — increasing cost per kg."))
     elif small_pct > 15:
         insights.append(("warn","📦", f"Small lots represent <strong>{small_pct:.1f}%</strong> of total lots. Monitor — above 30% is costly."))
     if dye is not None and not dye.empty:
@@ -1597,6 +1776,238 @@ def render_cost_block(scope_df, scope_chem, scope_dye, scope_label=""):
     with cost_tabs[4]: render_cost_flag_table(scope_df)
 
 
+def render_raw_data(view_df):
+    """Raw data / Excel-mode expander, reused by both day & month views at their
+    respective insertion points."""
+    with st.expander("🗃️ View Raw Data — Excel Mode"):
+        st.markdown(f"**{len(view_df):,} rows** after filters")
+        display_df = view_df.copy()
+        display_df["Production Date"] = display_df["Production Date"].dt.strftime("%d-%b-%Y")
+        drop_helpers = [c for c in ["_id","Month","Month_str"] if c in display_df.columns]
+        display_df = display_df.drop(columns=drop_helpers)
+
+        # ── reorder columns to match the Zoho report exactly ──
+        # maps the dashboard's internal column name → Zoho report header, in report order.
+        zoho_order = [
+            ("Production Date", "Production Date"),
+            ("Party Name",      "Party Name"),
+            ("QUALITY",         "Quality"),
+            ("SIZE",            "Size"),
+            ("SHADE",           "Shade"),
+            ("M.No.",           "M.No."),
+            ("MTRS",            "Mtrs"),
+            ("Weight",          "Weight"),
+            ("LOT NO.",         "Lot No."),
+            ("MASTER NAME",     "Masrer Name"),
+            ("Business Type",   "Business Type"),
+            ("Total Cost",          "Total Cost"),
+            ("Total Chemical Cost", "Total Chemical Cost"),
+            ("Total Dye Cost",      "Total Dye Cost"),
+            ("Total Chemical %",    "Total Chemical Percentage"),
+            ("Total Dye %",         "Total Dye Percentage"),
+            ("Total Cost Amount",   "Total_Cost_Amount"),
+        ]
+        ordered_internal = [src for src, _ in zoho_order if src in display_df.columns]
+        rename_to_zoho   = {src: dst for src, dst in zoho_order if src in display_df.columns}
+        display_df = display_df[ordered_internal].rename(columns=rename_to_zoho)
+        col_search, col_download = st.columns([3, 1])
+        with col_search:
+            search = st.text_input("🔍 Search", placeholder="Type to filter any column...", label_visibility="collapsed")
+        with col_download:
+            csv = display_df.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download CSV", csv, "dyeing_data.csv", "text/csv", use_container_width=True)
+        if search:
+            mask = display_df.apply(lambda col: col.astype(str).str.contains(search, case=False, na=False)).any(axis=1)
+            display_df = display_df[mask]
+        st.markdown(f"<div style='color:#6b7280;font-size:11px;margin-bottom:6px;'>Showing <b>{len(display_df):,}</b> rows · MTRS: <b style='color:#d97706'>{fmt_in(display_df['Mtrs'].sum())}</b> · Weight: <b style='color:#3b82f6'>{fmt_in(display_df['Weight'].sum())}</b></div>", unsafe_allow_html=True)
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
+        agg1, agg2, agg3, agg4 = st.columns(4)
+        agg1.metric("Sum MTRS", fmt_in(display_df['Mtrs'].sum()))
+        agg2.metric("Avg MTRS", fmt_in(int(display_df['Mtrs'].mean())) if len(display_df) else "0")
+        agg3.metric("Sum Weight", fmt_in(display_df['Weight'].sum()))
+        agg4.metric("Avg Weight", fmt_in(int(display_df['Weight'].mean())) if len(display_df) else "0")
+
+
+# ═══════════════════════════════════════════════════════════
+# SOFTFLOW-STYLE PRODUCTION SHEET  (NEW — additive only, Day-Wise view only)
+# Grouped by M.No., matching the handwritten paper register layout.
+# Daily = selected date's numbers (respects top filters).
+# Up to Date = true all-time cumulative from the very first record
+# through the selected date (uses the full unfiltered "raw" dataset).
+# ═══════════════════════════════════════════════════════════
+def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_to):
+    """Challan-style register, matching the paper 'Production Sheet' layout the
+    client uses today. Field mapping (client-confirmed):
+        Date    = Production Date        Customer = Party Name
+        Product = QUALITY                Colour   = SHADE
+        G.Qty   = Weight
+    Each lot is followed by its itemised chemical + dye lines (name, qty in kg,
+    corrected rate, corrected amount — using the SCD-2 rate-correction pass) and
+    a subtotal row, exactly like the physical register. Amount is a single
+    combined column (per item, and Sub Total per lot); the per-kg rate is still
+    broken out into Chem ₹/Kg / Dye ₹/Kg / Total ₹/Kg on the Sub Total row."""
+    section_header("🧾", "Party Ledger / Challan Report",
+                    f"From {date_from.strftime('%d/%m/%Y')} To {date_to.strftime('%d/%m/%Y')}")
+
+    if scope_df.empty:
+        st.info("ℹ️ No lots in the selected date range.")
+        return
+
+    # combine corrected chemical + dye line-items, keyed by parent lot id, tagged by Type
+    item_parts = []
+    if scope_chem is not None and not scope_chem.empty:
+        c = scope_chem[["_parent", "Item", "Quantity_g", "Rate_per_Kg", "Cost"]].copy()
+        c["Type"] = "Chemical"
+        item_parts.append(c)
+    if scope_dye is not None and not scope_dye.empty:
+        d = scope_dye[["_parent", "Item", "Quantity_g", "Rate_per_Kg", "Cost"]].copy()
+        d["Type"] = "Dye"
+        item_parts.append(d)
+    items = pd.concat(item_parts, ignore_index=True) if item_parts else pd.DataFrame(
+        columns=["_parent", "Item", "Quantity_g", "Rate_per_Kg", "Cost", "Type"])
+
+    lots = scope_df.sort_values("Production Date").reset_index(drop=True)
+    rows_html = ""
+    grand_gqty = grand_chem = grand_dye = grand_amount = 0.0
+
+    for i, r in lots.iterrows():
+        gqty = r["Weight"]
+        grand_gqty += gqty
+
+        rows_html += (f"<tr>"
+            f"<td>{i+1}</td>"
+            f"<td>{r['Production Date'].strftime('%d-%m-%y')}</td>"
+            f"<td style='text-align:left;'>{r['Party Name']}</td>"
+            f"<td>{r.get('LOT NO.','')}</td>"
+            f"<td style='text-align:left;'>{r['QUALITY']}</td>"
+            f"<td style='text-align:left;'>{r['SHADE']}</td>"
+            f"<td>{fmt_in(gqty)}</td>"
+            f"<td colspan='6'></td></tr>")
+
+        lot_all = items[items["_parent"] == r["_id"]]
+        dye_items  = lot_all[lot_all["Type"] == "Dye"].sort_values("Cost", ascending=False)
+        chem_items = lot_all[lot_all["Type"] == "Chemical"].sort_values("Cost", ascending=False)
+
+        lot_chem = lot_dye = 0.0
+
+        for _, it in dye_items.iterrows():
+            qty_kg = it["Quantity_g"] / 1000.0
+            lot_dye += it["Cost"]
+            rows_html += (f"<tr style='color:#6b7280;'>"
+                f"<td></td><td></td><td></td><td></td><td></td>"
+                f"<td style='text-align:left;'>{it['Item']}</td><td></td>"
+                f"<td>{qty_kg:.2f}</td><td>₹{it['Rate_per_Kg']:.2f}</td>"
+                f"<td>{fmt_cur(it['Cost'])}</td>"
+                f"<td></td><td></td><td></td></tr>")
+
+        # thin divider between the Dye block and Chemical block (only when both exist)
+        if not dye_items.empty and not chem_items.empty:
+            rows_html += "<tr><td colspan='13' style='background:#cbd5e1;padding:1px;border:none;'></td></tr>"
+
+        for _, it in chem_items.iterrows():
+            qty_kg = it["Quantity_g"] / 1000.0
+            lot_chem += it["Cost"]
+            rows_html += (f"<tr style='color:#6b7280;'>"
+                f"<td></td><td></td><td></td><td></td><td></td>"
+                f"<td style='text-align:left;'>{it['Item']}</td><td></td>"
+                f"<td>{qty_kg:.2f}</td><td>₹{it['Rate_per_Kg']:.2f}</td>"
+                f"<td>{fmt_cur(it['Cost'])}</td>"
+                f"<td></td><td></td><td></td></tr>")
+
+        lot_amount = lot_chem + lot_dye
+        grand_chem += lot_chem; grand_dye += lot_dye; grand_amount += lot_amount
+        chem_per_kg  = (lot_chem  / gqty) if gqty else 0
+        dye_per_kg   = (lot_dye   / gqty) if gqty else 0
+        total_per_kg = (lot_amount / gqty) if gqty else 0
+        rows_html += (f"<tr class='prod-sheet-total'>"
+            f"<td colspan='6'><b>Sub Total {r.get('LOT NO.','')}</b></td>"
+            f"<td><b>{fmt_in(gqty)}</b></td><td></td><td></td>"
+            f"<td><b>{fmt_cur(lot_amount)}</b></td>"
+            f"<td style='background:#fef9c3;color:#92400e;'><b>{chem_per_kg:.2f}</b></td>"
+            f"<td style='background:#fef9c3;color:#92400e;'><b>{dye_per_kg:.2f}</b></td>"
+            f"<td style='background:#fde68a;color:#92400e;'><b>{total_per_kg:.2f}</b></td></tr>")
+
+    st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:16px;">
+      <table class="prod-sheet-table">
+        <thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Lot No</th><th>Product</th>
+        <th>Colour / Item</th><th>G.Qty</th><th>Qty (kg)</th><th>Rate</th><th>Amount</th>
+        <th>Chem ₹/Kg</th><th>Dye ₹/Kg</th><th>Total ₹/Kg</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table></div>""", unsafe_allow_html=True)
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("🧵 Lots", len(lots))
+    k2.metric("⚖️ Total G.Qty (kg)", fmt_in(int(grand_gqty)))
+    k3.metric("🧪 Total Chemical Amount", fmt_cur(grand_chem))
+    k4.metric("🧴 Total Dye Amount", fmt_cur(grand_dye))
+    k5.metric("💰 Total Amount", fmt_cur(grand_amount))
+
+
+
+def render_softflow_sheet(day_df, raw_all, sel_day):
+    section_divider("🧵 Softflow Production Sheet")
+
+    if "M.No." not in day_df.columns:
+        st.info("ℹ️ Machine Number (M.No.) column not found in data.")
+        return
+
+    display_cols = ["Party Name", "QUALITY", "SHADE", "SIZE", "MTRS", "Weight", "LOT NO."]
+    display_cols = [c for c in display_cols if c in day_df.columns]
+
+    # keep only machines that actually have lots today (paper sheet skips blanks)
+    machines = [m for m in day_df["M.No."].unique() if not day_df[day_df["M.No."] == m].empty]
+    def _mkey(m):
+        try:
+            return (0, float(m))
+        except Exception:
+            return (1, str(m))
+    machines = sorted(machines, key=_mkey)
+
+    rows_html = ""
+    for m in machines:
+        grp = day_df[day_df["M.No."] == m][display_cols].reset_index(drop=True)
+        for i, r in grp.iterrows():
+            mno_cell = f"<td rowspan='{len(grp)}' style='background:#f8faff;font-weight:700;color:#1e3a5f;vertical-align:middle;'>{m}</td>" if i == 0 else ""
+            cells = ""
+            for col in display_cols:
+                if col in ("MTRS", "Weight"):
+                    cells += f"<td><b>{fmt_in(r[col])}</b></td>"
+                else:
+                    cells += f"<td>{r[col]}</td>"
+            rows_html += f"<tr>{mno_cell}{cells}</tr>"
+        rows_html += f"<tr><td colspan='{len(display_cols)+1}' style='background:#1e3a5f;padding:2px;'></td></tr>"
+
+    headers_html = "<th>M.No.</th>" + "".join(f"<th>{c}</th>" for c in display_cols)
+    st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:16px;">
+      <table class="prod-sheet-table"><thead><tr>{headers_html}</tr></thead>
+      <tbody>{rows_html}</tbody></table></div>""", unsafe_allow_html=True)
+
+    # ── Daily vs Up-to-Date strip ──
+    daily_metres = day_df["MTRS"].sum()
+    daily_weight = day_df["Weight"].sum()
+    daily_lots   = len(day_df)
+
+    cum_df = raw_all[raw_all["Production Date"].dt.date <= sel_day]
+    cum_metres = cum_df["MTRS"].sum()
+    cum_weight = cum_df["Weight"].sum()
+    cum_lots   = len(cum_df)
+
+    strip_rows = [
+        ("📏 Meters", fmt_in(int(daily_metres)), fmt_in(int(cum_metres))),
+        ("⚖️ Weight (kg)", fmt_in(int(daily_weight)), fmt_in(int(cum_weight))),
+        ("🧵 Lots", fmt_in(int(daily_lots)), fmt_in(int(cum_lots))),
+    ]
+    cols = st.columns(3)
+    for col, (label, daily_val, cum_val) in zip(cols, strip_rows):
+        col.markdown(f"""<div class="mom-card">
+          <div class="lbl">{label}</div>
+          <div class="val">{daily_val}</div>
+          <div style="font-size:11px;color:#9ca3af;margin-top:4px;">Daily</div>
+          <div class="val" style="font-size:1.15rem;margin-top:10px;">{cum_val}</div>
+          <div style="font-size:11px;color:#9ca3af;margin-top:4px;">Up to Date (all-time cumulative)</div>
+        </div>""", unsafe_allow_html=True)
+
+
 # ═══════════════════════════════════════════════════════════
 # DAY WISE VIEW
 # ═══════════════════════════════════════════════════════════
@@ -1699,6 +2110,11 @@ if current_view == "day":
     rows_day = "".join(f"<tr><td>{r['Party Name']}</td><td>{fmt_in(r['Metres'])}</td><td>{fmt_in(r['Weight_kg'])}</td><td>{int(r['Lots'])}</td><td>{r['Avg KG/Lot']:.1f}</td><td>{fmt_in(r['Avg Mtrs/Lot'])}</td><td>{r['Share % (Weight)']:.1f}%</td></tr>" for _, r in day_sum.iterrows())
     st.markdown(f"""<div style="background:#fff;border:1px solid #e8ecf2;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.05);"><table class="sum-table"><thead><tr><th>Party</th><th>Metres</th><th>Weight (kg)</th><th>Lots</th><th>Avg KG/Lot</th><th>Avg Mtrs/Lot</th><th>Share % (Weight)</th></tr></thead><tbody>{rows_day}</tbody></table></div>""", unsafe_allow_html=True)
 
+    render_raw_data(day_df)
+
+    # ── NEW: Softflow-style production sheet (additive only) ──
+    render_softflow_sheet(day_df, raw, sel_day)
+
     st.divider()
     section_divider("🧠 Business Decision Analysis — Day View")
     an_tabs = st.tabs(["⚙️ Machines", "👤 Masters", "📦 Lot Sizes", "🏭 Parties",
@@ -1721,7 +2137,7 @@ if current_view == "day":
 # ═══════════════════════════════════════════════════════════
 # MONTH WISE VIEW
 # ═══════════════════════════════════════════════════════════
-else:
+elif current_view == "month":
     df["Month"]     = df["Production Date"].dt.to_period("M")
     df["Month_str"] = df["Production Date"].dt.strftime("%B %Y")
     available_months = sorted(df["Month"].unique(), reverse=True)
@@ -1827,6 +2243,8 @@ else:
             fig_qtree.update_layout(paper_bgcolor="rgba(255,255,255,1)", font=dict(color="#374151"), height=380, margin=dict(l=0,r=0,t=0,b=0))
             fig_qtree.update_coloraxes(showscale=False); pc(fig_qtree)
 
+    render_raw_data(month_df)
+
     st.divider()
     section_divider("🧠 Business Decision Analysis — Month View")
     an_tabs = st.tabs(["⚙️ Machines", "👤 Masters", "📦 Lot Sizes", "🏭 Parties",
@@ -1847,57 +2265,28 @@ else:
     render_business_insights(month_df, month_chem, month_dye, scope_label=month_labels[sel_month_str])
 
 
-# ─────────────────────────────────────────────
-# RAW DATA EXPANDER
-# ─────────────────────────────────────────────
-view_df = day_df if current_view == "day" else month_df
-with st.expander("🗃️ View Raw Data — Excel Mode"):
-    st.markdown(f"**{len(view_df):,} rows** after filters")
-    display_df = view_df.copy()
-    display_df["Production Date"] = display_df["Production Date"].dt.strftime("%d-%b-%Y")
-    drop_helpers = [c for c in ["_id","Month","Month_str"] if c in display_df.columns]
-    display_df = display_df.drop(columns=drop_helpers)
+# ═══════════════════════════════════════════════════════════
+# PARTY LEDGER / CHALLAN VIEW  (NEW — additive only)
+# Matches the paper "Production Sheet" register: date-range based,
+# grouped by lot, with itemised chemical + dye lines using the
+# SCD-2 corrected rate/cost, plus a subtotal row per lot.
+# ═══════════════════════════════════════════════════════════
+else:
+    lc1, lc2 = st.columns([2, 6])
+    with lc1:
+        ledger_range = st.date_input("Ledger date range", value=(min_date, max_date),
+            min_value=min_date, max_value=max_date, label_visibility="visible",
+            key="ledger_date_range")
+    if len(ledger_range) == 2:
+        l_from, l_to = pd.Timestamp(ledger_range[0]), pd.Timestamp(ledger_range[1])
+        ledger_df = df[(df["Production Date"] >= l_from) & (df["Production Date"] <= l_to)]
+    else:
+        l_from = l_to = pd.Timestamp(ledger_range[0])
+        ledger_df = df[df["Production Date"] == l_from]
+    ledger_chem = subset_sub(ledger_df, df_chem)
+    ledger_dye  = subset_sub(ledger_df, df_dye)
+    render_party_ledger_report(ledger_df, ledger_chem, ledger_dye, l_from, l_to)
 
-    # ── reorder columns to match the Zoho report exactly ──
-    # maps the dashboard's internal column name → Zoho report header, in report order.
-    zoho_order = [
-        ("Production Date", "Production Date"),
-        ("Party Name",      "Party Name"),
-        ("QUALITY",         "Quality"),
-        ("SIZE",            "Size"),
-        ("SHADE",           "Shade"),
-        ("M.No.",           "M.No."),
-        ("MTRS",            "Mtrs"),
-        ("Weight",          "Weight"),
-        ("LOT NO.",         "Lot No."),
-        ("MASTER NAME",     "Masrer Name"),
-        ("Business Type",   "Business Type"),
-        ("Total Cost",          "Total Cost"),
-        ("Total Chemical Cost", "Total Chemical Cost"),
-        ("Total Dye Cost",      "Total Dye Cost"),
-        ("Total Chemical %",    "Total Chemical Percentage"),
-        ("Total Dye %",         "Total Dye Percentage"),
-        ("Total Cost Amount",   "Total_Cost_Amount"),
-    ]
-    ordered_internal = [src for src, _ in zoho_order if src in display_df.columns]
-    rename_to_zoho   = {src: dst for src, dst in zoho_order if src in display_df.columns}
-    display_df = display_df[ordered_internal].rename(columns=rename_to_zoho)
-    col_search, col_download = st.columns([3, 1])
-    with col_search:
-        search = st.text_input("🔍 Search", placeholder="Type to filter any column...", label_visibility="collapsed")
-    with col_download:
-        csv = display_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download CSV", csv, "dyeing_data.csv", "text/csv", use_container_width=True)
-    if search:
-        mask = display_df.apply(lambda col: col.astype(str).str.contains(search, case=False, na=False)).any(axis=1)
-        display_df = display_df[mask]
-    st.markdown(f"<div style='color:#6b7280;font-size:11px;margin-bottom:6px;'>Showing <b>{len(display_df):,}</b> rows · MTRS: <b style='color:#d97706'>{fmt_in(display_df['Mtrs'].sum())}</b> · Weight: <b style='color:#3b82f6'>{fmt_in(display_df['Weight'].sum())}</b></div>", unsafe_allow_html=True)
-    st.dataframe(display_df, use_container_width=True, hide_index=True, height=400)
-    agg1, agg2, agg3, agg4 = st.columns(4)
-    agg1.metric("Sum MTRS", fmt_in(display_df['Mtrs'].sum()))
-    agg2.metric("Avg MTRS", fmt_in(int(display_df['Mtrs'].mean())) if len(display_df) else "0")
-    agg3.metric("Sum Weight", fmt_in(display_df['Weight'].sum()))
-    agg4.metric("Avg Weight", fmt_in(int(display_df['Weight'].mean())) if len(display_df) else "0")
 
 # ─────────────────────────────────────────────
 # FOOTER
