@@ -5,9 +5,13 @@ import plotly.graph_objects as go
 import requests
 import re
 import json
+import io
 import streamlit.components.v1 as components
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -364,6 +368,114 @@ def open_print_window(inner_html, title="Report", label="🖨️ Download / Prin
     """, height=48)
 
 
+def build_ledger_excel(lots, items, grand_gqty, grand_chem, grand_dye, grand_amount, date_from, date_to):
+    """Build the Party Ledger / Challan Report as a real .xlsx workbook — same
+    layout as the on-screen table: one header row per lot, its chemical/dye
+    line-items underneath, a bold Sub Total row, and a grand-total row at the
+    very end. Returns raw xlsx bytes, ready for st.download_button."""
+    headers = ["#", "Date", "Customer", "Lot No", "Product", "Colour / Item", "G.Qty",
+               "Qty (kg)", "Rate", "Amount", "Chem ₹/Kg", "Dye ₹/Kg", "Total ₹/Kg"]
+    n_cols = len(headers)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Party Ledger"
+
+    navy_fill  = PatternFill("solid", fgColor="1E3A5F")
+    white_bold = Font(color="FFFFFF", bold=True)
+    grey_font  = Font(color="6B7280")
+    thin       = Side(style="thin", color="D9D9D9")
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left   = Alignment(horizontal="left", vertical="center")
+
+    # title
+    ws.cell(row=1, column=1,
+            value=f"Party Ledger / Challan Report  —  From {date_from.strftime('%d/%m/%Y')} "
+                  f"To {date_to.strftime('%d/%m/%Y')}  ·  filtered by Chemical/Dye Date")
+    ws.cell(row=1, column=1).font = Font(bold=True, size=13)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+
+    # header row
+    header_row = 3
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=c, value=h)
+        cell.fill = navy_fill; cell.font = white_bold
+        cell.alignment = center; cell.border = cell_border
+
+    r_idx = header_row + 1
+    for i, r in lots.iterrows():
+        gqty = r["Weight"]
+        ws.append([i + 1, r["Recipe Date"].strftime("%d-%m-%Y"), r["Party Name"],
+                   r.get("LOT NO.", ""), r["QUALITY"], r["SHADE"], round(gqty), "", "", "", "", "", ""])
+        r_idx += 1
+
+        lot_all = items[items["_parent"] == r["_id"]]
+        dye_items  = lot_all[lot_all["Type"] == "Dye"].sort_values("Cost", ascending=False)
+        chem_items = lot_all[lot_all["Type"] == "Chemical"].sort_values("Cost", ascending=False)
+        lot_chem = lot_dye = 0.0
+
+        for _, it in dye_items.iterrows():
+            qty_kg = it["Quantity_g"] / 1000.0
+            lot_dye += it["Cost"]
+            ws.append(["", "", "", "", "", it["Item"], "", round(qty_kg, 2),
+                       round(it["Rate_per_Kg"], 2), round(it["Cost"], 2), "", "", ""])
+            for c in range(1, n_cols + 1):
+                ws.cell(row=r_idx, column=c).font = grey_font
+            r_idx += 1
+
+        for _, it in chem_items.iterrows():
+            qty_kg = it["Quantity_g"] / 1000.0
+            lot_chem += it["Cost"]
+            ws.append(["", "", "", "", "", it["Item"], "", round(qty_kg, 2),
+                       round(it["Rate_per_Kg"], 2), round(it["Cost"], 2), "", "", ""])
+            for c in range(1, n_cols + 1):
+                ws.cell(row=r_idx, column=c).font = grey_font
+            r_idx += 1
+
+        lot_amount = lot_chem + lot_dye
+        chem_per_kg  = (lot_chem / gqty) if gqty else 0
+        dye_per_kg   = (lot_dye / gqty) if gqty else 0
+        total_per_kg = (lot_amount / gqty) if gqty else 0
+        ws.append([f"Sub Total {r.get('LOT NO.', '')}", "", "", "", "", "", round(gqty),
+                   "", "", round(lot_amount, 2), round(chem_per_kg, 2),
+                   round(dye_per_kg, 2), round(total_per_kg, 2)])
+        for c in range(1, n_cols + 1):
+            cell = ws.cell(row=r_idx, column=c)
+            cell.fill = navy_fill; cell.font = white_bold
+        r_idx += 1
+
+    # borders + alignment for every data row
+    for row in ws.iter_rows(min_row=header_row + 1, max_row=r_idx - 1, min_col=1, max_col=n_cols):
+        for cell in row:
+            cell.border = cell_border
+            cell.alignment = left if cell.column in (3, 5, 6) else center
+
+    # grand totals summary block
+    r_idx += 1
+    summary = [
+        ("Lots", len(lots)),
+        ("Total G.Qty (kg)", round(grand_gqty)),
+        ("Total Chemical Amount", round(grand_chem, 2)),
+        ("Total Dye Amount", round(grand_dye, 2)),
+        ("Total Amount", round(grand_amount, 2)),
+    ]
+    for label, value in summary:
+        ws.cell(row=r_idx, column=1, value=label).font = Font(bold=True)
+        ws.cell(row=r_idx, column=2, value=value).font = Font(bold=True)
+        r_idx += 1
+
+    # column widths
+    widths = [5, 12, 22, 12, 16, 18, 10, 10, 10, 12, 10, 10, 11]
+    for c, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(c)].width = w
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def render_executive_snapshot(data, full=None, label=""):
     """Hero band with the headline numbers + traffic-light decision chips.
     This is the first thing a stakeholder sees — everything below is drill-down."""
@@ -463,15 +575,28 @@ def _to_num(x):
 def _parse_delimited_subrow(text):
     """Parse a Zoho sub-form display string into clean fields.
     Layout (validated against live data, Cost = Qty_kg × Rate holds for every row):
-        Chemical: Name, Cost, Quantity_g, Percentage, Rate_per_Kg
-        Dye:      Name, Cost, Percentage, Quantity_g, Rate_per_Kg
-    Cost is always first number, Rate always last; the two middles are Qty & % in
-    some order, disambiguated by which one reproduces Cost = (Qty/1000) × Rate."""
+        Chemical: Name, Cost, Quantity_g, Percentage, Rate_per_Kg [, Chemical_Date]
+        Dye:      Name, Cost, Percentage, Quantity_g, Rate_per_Kg [, Dye_Date]
+    Cost is always first number, Rate always last of the 4 numeric fields; the two
+    middles are Qty & % in some order, disambiguated by which one reproduces
+    Cost = (Qty/1000) × Rate.
+    A 6th field (the item's own date, e.g. "18-Sep-2026") was added after Chemical_Date/
+    Dye_Date were exposed as report columns — it's the LAST field, and can be blank
+    (trailing comma, e.g. "XNI,626.22,4500.00,0.90,139.16,"). Kept backward-compatible
+    with the older 5-field strings (no date column) some cached/older reports may still
+    send."""
     parts = [p.strip() for p in str(text).split(",")]
     if len(parts) < 5:
         return None
-    name = ", ".join(parts[:-4]).strip()
-    nums = [_to_num(p) for p in parts[-4:]]
+    if len(parts) >= 6:
+        date_str = parts[-1]
+        num_parts = parts[-5:-1]
+        name = ", ".join(parts[:-5]).strip()
+    else:
+        date_str = None
+        num_parts = parts[-4:]
+        name = ", ".join(parts[:-4]).strip()
+    nums = [_to_num(p) for p in num_parts]
     cost, rate = nums[0], nums[3]
     m1, m2 = nums[1], nums[2]
     if rate > 0:
@@ -479,7 +604,7 @@ def _parse_delimited_subrow(text):
     else:
         qty, pct = (m1, m2) if m1 >= m2 else (m2, m1)
     return {"Item": name or "Unknown", "Cost": cost, "Quantity_g": qty,
-            "Rate_per_Kg": rate, "Percentage": pct}
+            "Rate_per_Kg": rate, "Percentage": pct, "Item_Date": date_str or None}
 
 
 def _subrow_from_item(item):
@@ -507,10 +632,12 @@ def _subrow_from_item(item):
             flat[str(k).split(".")[-1].lower()] = dv(v)
     if not flat:
         return None
-    row = {"Item": None, "Quantity_g": 0, "Rate_per_Kg": 0, "Cost": 0, "Percentage": 0}
+    row = {"Item": None, "Quantity_g": 0, "Rate_per_Kg": 0, "Cost": 0, "Percentage": 0, "Item_Date": None}
     leftover = []
     for k, val in flat.items():
-        if "rate" in k:
+        if "date" in k:
+            row["Item_Date"] = val
+        elif "rate" in k:
             row["Rate_per_Kg"] = _to_num(val)
         elif "percent" in k or k.endswith("%"):
             row["Percentage"] = _to_num(val)
@@ -595,12 +722,15 @@ def _load_lines_report(report_name):
         recs = resp.json().get("data", [])
         if not recs:
             break
-        if not ldiag["all_fields"]:                     # capture shape from first record
+        if not ldiag["all_fields"]:                     # capture column shape from first record
             ldiag["all_fields"] = list(recs[0].keys())
-            for k, v in recs[0].items():
-                if isinstance(v, list):
-                    ldiag["list_fields"][k] = v[0] if v else None
         for rec in recs:
+            # capture a RAW sample of each sub-form field from the first record that
+            # actually has a non-empty array — record #1 can easily have no chemical/
+            # dye lines, which is why the diagnostic previously showed "None" here.
+            for k, v in rec.items():
+                if isinstance(v, list) and v and not ldiag["list_fields"].get(k):
+                    ldiag["list_fields"][k] = v[0]
             _explode_record(rec, chem_rows, dye_rows)
         ldiag["records"] += len(recs)
         if len(recs) < limit:
@@ -938,6 +1068,12 @@ def load_data():
             sub["Item"] = sub.get("Item", "Unknown")
             sub["Item"] = sub["Item"].fillna("Unknown").astype(str).str.strip().replace(
                 {"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+            # the item's own Chemical_Date / Dye_Date (comes from the sub-form itself,
+            # separate from the lot's Production Date) — blank for some chemical rows.
+            if "Item_Date" in sub.columns:
+                sub["Item_Date"] = parse_dates(sub["Item_Date"].astype(str))
+            else:
+                sub["Item_Date"] = pd.NaT
 
     # attach key dimensions to sub-forms for filtering / grouping
     if not df.empty:
@@ -960,6 +1096,33 @@ def load_data():
             df_chem = df_chem.merge(dims, left_on="_parent", right_on="_id", how="left")
         if not df_dye.empty:
             df_dye = df_dye.merge(dims, left_on="_parent", right_on="_id", how="left")
+
+        # ── "Recipe Date" — one effective date per lot, used ONLY by the Party
+        # Ledger's own date filter (everything else keeps using Production Date).
+        # Chemical_Date and Dye_Date are entered together and are the same value,
+        # but Chemical_Date sometimes comes in blank — so take whichever of a lot's
+        # chemical/dye line-item dates is present. NO fallback to Production Date:
+        # Chemical_Date/Dye_Date were only added as report columns recently, so
+        # older lots genuinely have no chemical/dye date at all — those lots are
+        # correctly left out of the Party Ledger (there's no valid chem/dye date
+        # to place them on) rather than being shown under a borrowed Production
+        # Date, which was misleading (e.g. showing a June date with no real
+        # chemical/dye entry behind it).
+        date_parts = []
+        if not df_chem.empty and "_parent" in df_chem.columns and "Item_Date" in df_chem.columns:
+            date_parts.append(df_chem[["_parent", "Item_Date"]])
+        if not df_dye.empty and "_parent" in df_dye.columns and "Item_Date" in df_dye.columns:
+            date_parts.append(df_dye[["_parent", "Item_Date"]])
+        if date_parts:
+            item_dates = pd.concat(date_parts, ignore_index=True).dropna(subset=["Item_Date"])
+        else:
+            item_dates = pd.DataFrame(columns=["_parent", "Item_Date"])
+        if not item_dates.empty:
+            lot_date_map = item_dates.groupby("_parent")["Item_Date"].min()
+            df["Recipe Date"] = df["_id"].map(lot_date_map)
+        else:
+            df["Recipe Date"] = pd.NaT
+        # (no fallback to Production Date — see comment above)
 
     df, df_chem, df_dye = _apply_scd2_rate_corrections(df, df_chem, df_dye)
 
@@ -1935,7 +2098,8 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
     combined column (per item, and Sub Total per lot); the per-kg rate is still
     broken out into Chem ₹/Kg / Dye ₹/Kg / Total ₹/Kg on the Sub Total row."""
     section_header("🧾", "Party Ledger / Challan Report",
-                    f"From {date_from.strftime('%d/%m/%Y')} To {date_to.strftime('%d/%m/%Y')}")
+                    f"From {date_from.strftime('%d/%m/%Y')} To {date_to.strftime('%d/%m/%Y')} "
+                    f"&nbsp;·&nbsp; filtered by Chemical/Dye Date")
 
     if scope_df.empty:
         st.info("ℹ️ No lots in the selected date range.")
@@ -1954,7 +2118,7 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
     items = pd.concat(item_parts, ignore_index=True) if item_parts else pd.DataFrame(
         columns=["_parent", "Item", "Quantity_g", "Rate_per_Kg", "Cost", "Type"])
 
-    lots = scope_df.sort_values("Production Date").reset_index(drop=True)
+    lots = scope_df.sort_values("Recipe Date").reset_index(drop=True)
     rows_html = ""
     grand_gqty = grand_chem = grand_dye = grand_amount = 0.0
 
@@ -1964,7 +2128,7 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
 
         rows_html += (f"<tr>"
             f"<td>{i+1}</td>"
-            f"<td>{r['Production Date'].strftime('%d-%m-%y')}</td>"
+            f"<td>{r['Recipe Date'].strftime('%d-%m-%y')}</td>"
             f"<td style='text-align:left;'>{r['Party Name']}</td>"
             f"<td>{r.get('LOT NO.','')}</td>"
             f"<td style='text-align:left;'>{r['QUALITY']}</td>"
@@ -2034,9 +2198,17 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
         f"&nbsp;·&nbsp; Total Amount {fmt_cur(grand_amount)}</div>"
         f"{table_only_html}"
     )
-    pb1, pb2 = st.columns([2, 6])
+    pb1, pb2, pb3 = st.columns([2, 2, 4])
     with pb1:
         open_print_window(print_body, title=print_title, label="🖨️ Download Party Ledger as PDF")
+    with pb2:
+        excel_bytes = build_ledger_excel(lots, items, grand_gqty, grand_chem, grand_dye,
+                                          grand_amount, date_from, date_to)
+        st.download_button(
+            "⬇️ Download as Excel", data=excel_bytes,
+            file_name=f"party_ledger_{date_from:%Y%m%d}_{date_to:%Y%m%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True)
     if len(lots) > 400:
         st.caption("⚠️ Large date range — if the PDF still fails to generate, "
                     "narrow the date range and export in smaller batches.")
@@ -2379,19 +2551,34 @@ elif current_view == "month":
 # Matches the paper "Production Sheet" register: date-range based,
 # grouped by lot, with itemised chemical + dye lines using the
 # SCD-2 corrected rate/cost, plus a subtotal row per lot.
+#
+# Filtered by "Recipe Date" (the Chemical_Date / Dye_Date entered on the lot's
+# own sub-form line-items — NOT Production Date), per client request. A lot's
+# Chemical_Date and Dye_Date are the same value, but Chemical_Date sometimes
+# comes in blank, so Recipe Date already falls back lot-by-lot to whichever of
+# the two is present (computed once in load_data()), and further falls back to
+# Production Date only for a lot with no chemical/dye date recorded at all.
 # ═══════════════════════════════════════════════════════════
 else:
+    ledger_valid_dates = df["Recipe Date"].dropna()
+    if not ledger_valid_dates.empty:
+        ledger_min_date = ledger_valid_dates.min().date()
+        ledger_max_date = ledger_valid_dates.max().date()
+    else:
+        ledger_min_date, ledger_max_date = min_date, max_date
+
     lc1, lc2 = st.columns([2, 6])
     with lc1:
-        ledger_range = st.date_input("Ledger date range", value=(min_date, max_date),
-            min_value=min_date, max_value=max_date, label_visibility="visible",
+        ledger_range = st.date_input("Ledger date range (by Chemical/Dye date)",
+            value=(ledger_min_date, ledger_max_date),
+            min_value=ledger_min_date, max_value=ledger_max_date, label_visibility="visible",
             key="ledger_date_range")
     if len(ledger_range) == 2:
         l_from, l_to = pd.Timestamp(ledger_range[0]), pd.Timestamp(ledger_range[1])
-        ledger_df = df[(df["Production Date"] >= l_from) & (df["Production Date"] <= l_to)]
+        ledger_df = df[(df["Recipe Date"] >= l_from) & (df["Recipe Date"] <= l_to)]
     else:
         l_from = l_to = pd.Timestamp(ledger_range[0])
-        ledger_df = df[df["Production Date"] == l_from]
+        ledger_df = df[df["Recipe Date"] == l_from]
     ledger_chem = subset_sub(ledger_df, df_chem)
     ledger_dye  = subset_sub(ledger_df, df_dye)
     render_party_ledger_report(ledger_df, ledger_chem, ledger_dye, l_from, l_to)
