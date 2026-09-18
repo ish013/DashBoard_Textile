@@ -4,6 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import re
+import json
+import streamlit.components.v1 as components
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -168,6 +170,26 @@ h2, h3 { color:#111827 !important;font-weight:700 !important; }
 .stTabs [data-baseweb="tab-panel"] { padding-top:18px; }
 
 @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+
+/* ── Print / PDF export (used by the "Download as PDF" button) ──
+   Hides everything except the element carrying .print-area when a
+   print is triggered from inside it (see print_pdf_button()). */
+@media print {
+  [data-testid="stSidebar"],
+  [data-testid="stHeader"],
+  [data-testid="stToolbar"],
+  .stButton,
+  #MainMenu,
+  footer,
+  .stTabs [data-baseweb="tab-list"],
+  .live-badge,
+  .filter-bar-wrap { display: none !important; }
+  .stApp { background: #ffffff !important; }
+  .prod-sheet-table, .prod-sheet-table th, .prod-sheet-table td,
+  .prod-sheet-total td {
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -274,6 +296,72 @@ def cost_widget(value, label, sub):
       <div class="cost-metric-label">{label}</div>
       <div class="cost-metric-value">{value}</div>
       <div class="cost-metric-sub">{sub}</div></div>""", unsafe_allow_html=True)
+
+
+def print_pdf_button(label="🖨️ Download / Print as PDF"):
+    """One-click browser print-to-PDF for the WHOLE current page.
+    Kept for any small/simple view. NOT used for the Party Ledger anymore —
+    see open_print_window() below, which avoids the Out-of-Memory crash on
+    large tables by printing a separate, lightweight document instead of the
+    whole heavy dashboard (sidebar + hidden tabs + charts all still in the DOM)."""
+    components.html(f"""
+        <button onclick="window.parent.print()" style="
+            width:100%;background:linear-gradient(135deg,#1e3a5f,#2d5f8a);color:#fff;border:none;
+            border-radius:10px;padding:10px 18px;font-weight:600;font-size:0.85rem;
+            font-family:'Inter',sans-serif;cursor:pointer;
+            box-shadow:0 3px 10px rgba(30,58,95,.25);">
+            {label}
+        </button>
+    """, height=48)
+
+
+def open_print_window(inner_html, title="Report", label="🖨️ Download / Print as PDF"):
+    """Prints ONLY `inner_html` in a brand-new, bare browser tab — not the live
+    dashboard. This is what actually fixes the 'Out of Memory' crash: the old
+    approach (window.parent.print()) made the browser paginate the entire
+    Streamlit app (sidebar, every hidden tab, every Plotly chart still sitting
+    in the DOM) *plus* a table that can run into thousands of rows on a wide
+    date range — too much for the print renderer to hold in memory at once.
+    A separate plain-HTML tab has none of that overhead: no React/Streamlit
+    runtime, no charts, no other views, just the table itself."""
+    safe_html  = json.dumps(inner_html)
+    safe_title = json.dumps(title)
+    components.html(f"""
+        <button id="pdf-btn" style="
+            width:100%;background:linear-gradient(135deg,#1e3a5f,#2d5f8a);color:#fff;border:none;
+            border-radius:10px;padding:10px 18px;font-weight:600;font-size:0.85rem;
+            font-family:'Inter',sans-serif;cursor:pointer;
+            box-shadow:0 3px 10px rgba(30,58,95,.25);">
+            {label}
+        </button>
+        <script>
+        document.getElementById('pdf-btn').addEventListener('click', function() {{
+            var w = window.open('', '_blank');
+            if (!w) {{ alert('Please allow pop-ups for this site, then click the button again.'); return; }}
+            var html = {safe_html};
+            var title = {safe_title};
+            w.document.open();
+            w.document.write(
+                '<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + title + '</title>' +
+                '<style>' +
+                '@page {{ size: A4 landscape; margin: 10mm; }}' +
+                'body{{font-family:Arial,Helvetica,sans-serif;margin:0;color:#1f2937;}}' +
+                'h2{{margin:0 0 4px;}}' +
+                '.sub{{color:#6b7280;font-size:12px;margin-bottom:14px;}}' +
+                'table{{width:100%;border-collapse:collapse;font-size:11px;}}' +
+                'th{{background:#1e3a5f;color:#fff;padding:6px 8px;text-align:center;font-size:10px;border:1px solid #2d4f7a;}}' +
+                'td{{padding:5px 8px;border:1px solid #e5e7eb;text-align:center;font-size:10px;}}' +
+                'tr:nth-child(even) td{{background:#f8faff;}}' +
+                '.prod-sheet-total td{{background:#1e3a5f !important;color:#fff !important;font-weight:700;-webkit-print-color-adjust:exact;print-color-adjust:exact;}}' +
+                'tr{{page-break-inside:avoid;}}' +
+                '</style></head><body>' + html + '</body></html>'
+            );
+            w.document.close();
+            w.focus();
+            setTimeout(function() {{ w.print(); }}, 350);
+        }});
+        </script>
+    """, height=48)
 
 
 def render_executive_snapshot(data, full=None, label=""):
@@ -1927,13 +2015,34 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
             f"<td style='background:#fef9c3;color:#92400e;'><b>{dye_per_kg:.2f}</b></td>"
             f"<td style='background:#fde68a;color:#92400e;'><b>{total_per_kg:.2f}</b></td></tr>")
 
+    table_only_html = (
+        "<table class='prod-sheet-table'>"
+        "<thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Lot No</th><th>Product</th>"
+        "<th>Colour / Item</th><th>G.Qty</th><th>Qty (kg)</th><th>Rate</th><th>Amount</th>"
+        "<th>Chem ₹/Kg</th><th>Dye ₹/Kg</th><th>Total ₹/Kg</th></tr></thead>"
+        f"<tbody>{rows_html}</tbody></table>"
+    )
+
+    # ── PDF button at the TOP of the report ──
+    # Printed via a separate bare tab (open_print_window), not the live
+    # dashboard — see that function's docstring for why (Out-of-Memory fix).
+    print_title = f"Party Ledger {date_from.strftime('%d-%m-%Y')} to {date_to.strftime('%d-%m-%Y')}"
+    print_body = (
+        f"<h2>Party Ledger / Challan Report</h2>"
+        f"<div class='sub'>From {date_from.strftime('%d/%m/%Y')} To {date_to.strftime('%d/%m/%Y')} "
+        f"&nbsp;·&nbsp; {len(lots)} lots &nbsp;·&nbsp; Total G.Qty {fmt_in(int(grand_gqty))} kg "
+        f"&nbsp;·&nbsp; Total Amount {fmt_cur(grand_amount)}</div>"
+        f"{table_only_html}"
+    )
+    pb1, pb2 = st.columns([2, 6])
+    with pb1:
+        open_print_window(print_body, title=print_title, label="🖨️ Download Party Ledger as PDF")
+    if len(lots) > 400:
+        st.caption("⚠️ Large date range — if the PDF still fails to generate, "
+                    "narrow the date range and export in smaller batches.")
+
     st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:16px;">
-      <table class="prod-sheet-table">
-        <thead><tr><th>#</th><th>Date</th><th>Customer</th><th>Lot No</th><th>Product</th>
-        <th>Colour / Item</th><th>G.Qty</th><th>Qty (kg)</th><th>Rate</th><th>Amount</th>
-        <th>Chem ₹/Kg</th><th>Dye ₹/Kg</th><th>Total ₹/Kg</th></tr></thead>
-        <tbody>{rows_html}</tbody>
-      </table></div>""", unsafe_allow_html=True)
+      {table_only_html}</div>""", unsafe_allow_html=True)
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("🧵 Lots", len(lots))
