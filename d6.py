@@ -125,6 +125,10 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .prod-sheet-table tr:nth-child(even) td { background:#f8faff; }
 .prod-sheet-table tr:hover td { background:#fef3c7; }
 .prod-sheet-total td { background:#1e3a5f !important;color:#ffffff !important;font-weight:700; }
+/* Total ₹/Kg threshold highlight — higher specificity (.prod-sheet-total td.tpk-…)
+   than the plain ".prod-sheet-total td" rule above, so these always win. */
+.prod-sheet-total td.tpk-yellow { background:#fde68a !important; color:#92400e !important; }
+.prod-sheet-total td.tpk-red    { background:#fecaca !important; color:#b91c1c !important; }
 
 .stButton > button { border-radius:10px !important;font-weight:600 !important;font-size:0.85rem !important;transition:all .15s !important; }
 .chart-card { background:#ffffff;border:1px solid #e8ecf2;border-radius:16px;padding:4px;box-shadow:0 1px 4px rgba(0,0,0,0.05);margin-bottom:4px; }
@@ -234,6 +238,41 @@ def fmt_cur(n):
         return "₹" + fmt_in(int(round(float(n))))
     except:
         return "₹0"
+
+# Party Ledger "Total ₹/Kg" threshold highlight (client-specified):
+#   > 10  → red     (high-cost lot, needs attention)
+#   > 7   → yellow  (caution)
+#   <= 7  → no highlight — leave the cell as-is (client explicitly does not
+#           want a green highlight for the normal/low range)
+# Returns (bg, fg) hex pair, or None if no highlight should be applied.
+# Shared by the on-screen table / PDF (hex used as inline CSS) and the Excel
+# export (hex used as openpyxl fill/font colors, without the "#").
+def total_per_kg_colors(val):
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v > 10:
+        return "#fecaca", "#b91c1c"   # red bg, red text
+    elif v > 7:
+        return "#fde68a", "#92400e"   # yellow bg, amber text
+    else:
+        return None
+
+def total_per_kg_class(val):
+    """CSS class name for the HTML/PDF table cell — a dedicated class with higher
+    specificity than '.prod-sheet-total td' beats it in the normal cascade, instead
+    of relying on inline-style-vs-stylesheet !important precedence (which some
+    browsers/render contexts were not resolving the way we expected)."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v > 10:
+        return "tpk-red"
+    elif v > 7:
+        return "tpk-yellow"
+    return ""
 
 PLOTLY_CFG = dict(
     scrollZoom=True, displayModeBar=True,
@@ -357,6 +396,8 @@ def open_print_window(inner_html, title="Report", label="🖨️ Download / Prin
                 'td{{padding:5px 8px;border:1px solid #e5e7eb;text-align:center;font-size:10px;}}' +
                 'tr:nth-child(even) td{{background:#f8faff;}}' +
                 '.prod-sheet-total td{{background:#1e3a5f !important;color:#fff !important;font-weight:700;-webkit-print-color-adjust:exact;print-color-adjust:exact;}}' +
+                '.prod-sheet-total td.tpk-yellow{{background:#fde68a !important;color:#92400e !important;}}' +
+                '.prod-sheet-total td.tpk-red{{background:#fecaca !important;color:#b91c1c !important;}}' +
                 'tr{{page-break-inside:avoid;}}' +
                 '</style></head><body>' + html + '</body></html>'
             );
@@ -443,6 +484,14 @@ def build_ledger_excel(lots, items, grand_gqty, grand_chem, grand_dye, grand_amo
         for c in range(1, n_cols + 1):
             cell = ws.cell(row=r_idx, column=c)
             cell.fill = navy_fill; cell.font = white_bold
+        # Total ₹/Kg (col 13) — threshold highlight overrides the navy sub-total
+        # fill for just this cell: >10 red, >7 yellow, <=7 left as default navy.
+        tpk_colors = total_per_kg_colors(total_per_kg)
+        if tpk_colors:
+            tpk_bg, tpk_fg = tpk_colors
+            tpk_cell = ws.cell(row=r_idx, column=13)
+            tpk_cell.fill = PatternFill("solid", fgColor=tpk_bg.lstrip("#"))
+            tpk_cell.font = Font(color=tpk_fg.lstrip("#"), bold=True)
         r_idx += 1
 
     # borders + alignment for every data row
@@ -2171,13 +2220,17 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
         chem_per_kg  = (lot_chem  / gqty) if gqty else 0
         dye_per_kg   = (lot_dye   / gqty) if gqty else 0
         total_per_kg = (lot_amount / gqty) if gqty else 0
+        # Dedicated classes (.prod-sheet-total td.tpk-…) — higher CSS specificity
+        # than the shared ".prod-sheet-total td" navy rule, so they always win,
+        # regardless of any inline-vs-stylesheet !important ordering quirks.
+        tpk_class = total_per_kg_class(total_per_kg)
         rows_html += (f"<tr class='prod-sheet-total'>"
             f"<td colspan='6'><b>Sub Total {r.get('LOT NO.','')}</b></td>"
             f"<td><b>{fmt_in(gqty)}</b></td><td></td><td></td>"
             f"<td><b>{fmt_cur(lot_amount)}</b></td>"
-            f"<td style='background:#fef9c3;color:#92400e;'><b>{chem_per_kg:.2f}</b></td>"
-            f"<td style='background:#fef9c3;color:#92400e;'><b>{dye_per_kg:.2f}</b></td>"
-            f"<td style='background:#fde68a;color:#92400e;'><b>{total_per_kg:.2f}</b></td></tr>")
+            f"<td><b>{chem_per_kg:.2f}</b></td>"
+            f"<td><b>{dye_per_kg:.2f}</b></td>"
+            f"<td class='{tpk_class}'><b>{total_per_kg:.2f}</b></td></tr>")
 
     table_only_html = (
         "<table class='prod-sheet-table'>"
@@ -2212,6 +2265,12 @@ def render_party_ledger_report(scope_df, scope_chem, scope_dye, date_from, date_
     if len(lots) > 400:
         st.caption("⚠️ Large date range — if the PDF still fails to generate, "
                     "narrow the date range and export in smaller batches.")
+
+    st.markdown("""<div style="font-size:12px;color:#6b7280;margin-bottom:10px;">
+      <b>Total ₹/Kg:</b>
+      <span style="background:#fde68a;color:#92400e;border-radius:4px;padding:1px 8px;margin:0 4px;">&gt; 7</span>
+      <span style="background:#fecaca;color:#b91c1c;border-radius:4px;padding:1px 8px;margin:0 4px;">&gt; 10</span>
+      </div>""", unsafe_allow_html=True)
 
     st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:16px;">
       {table_only_html}</div>""", unsafe_allow_html=True)
