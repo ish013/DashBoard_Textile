@@ -1177,6 +1177,247 @@ def load_data():
 
     return df, df_chem, df_dye, datetime.now(), failed, diag
 
+# ─────────────────────────────────────────────
+# INWARD / OUTWARD — STOCK REPORT
+# ─────────────────────────────────────────────
+@st.cache_data(ttl=900, show_spinner="Loading Inward/Outward data…")
+def load_inward_outward_data():
+    """Fetch the Inward & Outward report (Date_field, Party_Name, Inward, Outward)
+    the same way load_data() fetches the production report."""
+    cfg   = st.secrets["zoho_creator"]
+    owner = cfg["account_owner"]
+    app   = cfg["app_name"]
+    # Override in secrets.toml with io_report_name = "..." if you rename the report
+    report = cfg.get("io_report_name", "Inward_Outward_Report")
+    token  = get_access_token()
+
+    base_url = f"https://creator.zoho.in/api/v2/{owner}/{app}/report/{report}"
+    headers  = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+    all_records = []
+    start, limit = 0, 200
+    while True:
+        resp = requests.get(base_url, headers=headers,
+                             params={"from": start, "limit": limit, "field_config": "all"},
+                             timeout=20)
+        resp.raise_for_status()
+        recs = resp.json().get("data", [])
+        if not recs:
+            break
+        all_records.extend(recs)
+        if len(recs) < limit:
+            break
+        start += limit
+
+    if not all_records:
+        return pd.DataFrame(columns=["Date", "Party Name", "Inward", "Outward"])
+
+    rows = []
+    for rec in all_records:
+        rows.append({
+            "Date":       dv(rec.get("Date_field")),
+            "Party Name": dv(rec.get("Party_Name")),
+            "Inward":     _to_num(dv(rec.get("Inward"))),
+            "Outward":    _to_num(dv(rec.get("Outward"))),
+        })
+    df = pd.DataFrame(rows)
+    df["Date"] = parse_dates(df["Date"])
+    # apply the same party-name merge map used elsewhere, for consistency
+    df["Party Name"] = df["Party Name"].replace(PARTY_MERGE_MAP)
+    return df
+
+
+def build_stock_pivot(io_df, month_start, month_end, value_col="Inward", avg_mode="calendar"):
+    """Date-rows x Party-columns pivot for one month, with a Total row/column
+    and an Avg-per-day row. Columns are ordered by total volume, descending."""
+    scope = io_df[(io_df["Date"] >= month_start) & (io_df["Date"] <= month_end)]
+    if scope.empty:
+        return pd.DataFrame(), [], pd.Series(dtype=float), pd.Series(dtype=float)
+
+    pivot = scope.pivot_table(index="Date", columns="Party Name", values=value_col,
+                               aggfunc="sum", fill_value=0)
+
+    full_days = pd.date_range(month_start, month_end, freq="D")
+    pivot = pivot.reindex(full_days, fill_value=0)
+
+    party_totals = pivot.sum(axis=0).sort_values(ascending=False)
+    parties = list(party_totals.index)
+    pivot = pivot[parties]
+
+    days_in_month = len(full_days)
+    if avg_mode == "entries":
+        days_with_entry = (pivot > 0).sum(axis=0).replace(0, pd.NA)
+        avg_per_day = (party_totals / days_with_entry).fillna(0)
+    else:  # "calendar"
+        avg_per_day = party_totals / days_in_month
+
+    return pivot, parties, party_totals, avg_per_day
+
+
+def render_inward_outward_html(pivot, parties, party_totals, avg_per_day):
+    """On-screen table — reuses the existing .prod-sheet-table CSS class
+    already defined in this file, so it matches the rest of the dashboard."""
+    html = ["<table class='prod-sheet-table'>"]
+
+    # Avg per day row
+    html.append("<tr><th>Avg / day</th>")
+    for p in parties:
+        html.append(f"<td>{avg_per_day[p]:.1f}</td>")
+    html.append(f"<td><b>{avg_per_day.sum():.1f}</b></td></tr>")
+
+    # Header row
+    html.append("<tr><th>Date</th>")
+    for p in parties:
+        html.append(f"<th>{p}</th>")
+    html.append("<th>Total</th></tr>")
+
+    # Day rows (Sunday shaded, matching the client's sheet)
+    for day, row in pivot.iterrows():
+        is_sunday = day.weekday() == 6
+        row_cls = " style='background:#e5e7eb;'" if is_sunday else ""
+        html.append(f"<tr{row_cls}><td>{day.strftime('%d/%m/%Y')}</td>")
+        row_total = 0
+        for p in parties:
+            v = row[p]
+            row_total += v
+            html.append(f"<td>{v:g}</td>")
+        html.append(f"<td><b>{row_total:g}</b></td></tr>")
+
+    # Grand total row
+    html.append("<tr class='prod-sheet-total'><td><b>Total</b></td>")
+    grand = 0
+    for p in parties:
+        t = party_totals[p]
+        grand += t
+        html.append(f"<td><b>{t:g}</b></td>")
+    html.append(f"<td style='background:#10b981;color:#fff;'><b>{grand:g}</b></td></tr>")
+
+    html.append("</table>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
+def build_stock_excel(pivot, parties, party_totals, avg_per_day, month_label, value_label="Inward"):
+    """Downloadable .xlsx version of the same table, styled like the client's
+    sheet (yellow total row, green grand-total cell, grey Sunday rows)."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Stock {value_label}"
+
+    n_cols = len(parties) + 2  # Date + parties + Total
+    navy_fill   = PatternFill("solid", fgColor="1E3A5F")
+    yellow_fill = PatternFill("solid", fgColor="FFFF00")
+    green_fill  = PatternFill("solid", fgColor="92D050")
+    grey_fill   = PatternFill("solid", fgColor="D9D9D9")
+    white_bold  = Font(color="FFFFFF", bold=True)
+    bold        = Font(bold=True)
+    thin   = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+
+    # Title
+    ws.cell(row=1, column=1, value=f"STOCK {value_label.upper()} — {month_label}")
+    ws.cell(row=1, column=1).font = Font(bold=True, size=13)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+
+    # Avg-per-day row
+    ws.cell(row=2, column=1, value="Avg per day").font = bold
+    for c, p in enumerate(parties, start=2):
+        ws.cell(row=2, column=c, value=round(avg_per_day[p], 1))
+    ws.cell(row=2, column=n_cols, value=round(avg_per_day.sum(), 1)).font = bold
+
+    # Header row
+    header_row = 3
+    ws.cell(row=header_row, column=1, value="Date")
+    for c, p in enumerate(parties, start=2):
+        ws.cell(row=header_row, column=c, value=p)
+    ws.cell(row=header_row, column=n_cols, value="Total")
+    for c in range(1, n_cols + 1):
+        cell = ws.cell(row=header_row, column=c)
+        cell.fill = navy_fill; cell.font = white_bold; cell.alignment = center; cell.border = border
+
+    # Day rows
+    r = header_row + 1
+    for day, row_vals in pivot.iterrows():
+        ws.cell(row=r, column=1, value=day.strftime("%d/%m/%Y"))
+        row_total = 0
+        for c, p in enumerate(parties, start=2):
+            v = row_vals[p]
+            row_total += v
+            ws.cell(row=r, column=c, value=round(v, 2))
+        ws.cell(row=r, column=n_cols, value=round(row_total, 2)).font = bold
+        if day.weekday() == 6:  # Sunday
+            for c in range(1, n_cols + 1):
+                ws.cell(row=r, column=c).fill = grey_fill
+        for c in range(1, n_cols + 1):
+            ws.cell(row=r, column=c).border = border
+            ws.cell(row=r, column=c).alignment = center
+        r += 1
+
+    # Grand total row
+    ws.cell(row=r, column=1, value="Total").font = bold
+    grand = 0
+    for c, p in enumerate(parties, start=2):
+        t = party_totals[p]
+        grand += t
+        cell = ws.cell(row=r, column=c, value=round(t, 2))
+        cell.fill = yellow_fill; cell.font = bold
+    gcell = ws.cell(row=r, column=n_cols, value=round(grand, 2))
+    gcell.fill = green_fill; gcell.font = white_bold
+    for c in range(1, n_cols + 1):
+        ws.cell(row=r, column=c).border = border
+        ws.cell(row=r, column=c).alignment = center
+
+    ws.column_dimensions["A"].width = 14
+    for c in range(2, n_cols + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 13
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=2)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def render_inward_outward_view():
+    io_df = load_inward_outward_data()
+    if io_df.empty:
+        st.warning("⚠️ No Inward/Outward records found."); return
+
+    io_df = io_df.dropna(subset=["Date"])
+    months = sorted(io_df["Date"].dt.to_period("M").unique(), reverse=True)
+    month_labels = {m: m.strftime("%B %Y") for m in months}
+
+    c1, c2, c3 = st.columns([2, 2, 2])
+    with c1:
+        sel_month = st.selectbox("Month", months, format_func=lambda m: month_labels[m])
+    with c2:
+        value_col = st.radio("Show", ["Inward", "Outward"], horizontal=True)
+    with c3:
+        avg_mode = st.radio("Avg/day formula (unconfirmed)",
+                             ["calendar", "entries"], horizontal=True,
+                             format_func=lambda x: "÷ calendar days" if x == "calendar" else "÷ days with entry")
+
+    month_start = sel_month.to_timestamp()
+    month_end = month_start + pd.offsets.MonthEnd(0)
+
+    pivot, parties, totals, avg_per_day = build_stock_pivot(
+        io_df, month_start, month_end, value_col=value_col, avg_mode=avg_mode)
+
+    if pivot.empty:
+        st.info("No data for this month."); return
+
+    section_header("📦", f"Stock {value_col} — {month_labels[sel_month]}",
+                    "Date × Party, matching the client's sheet format")
+    render_inward_outward_html(pivot, parties, totals, avg_per_day)
+
+    xlsx_bytes = build_stock_excel(pivot, parties, totals, avg_per_day,
+                                    month_labels[sel_month], value_label=value_col)
+    st.download_button(
+        "⬇️ Download as Excel",
+        data=xlsx_bytes,
+        file_name=f"stock_{value_col.lower()}_{sel_month.strftime('%Y_%m')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 def subset_sub(parent_df, sub_df):
     """Filter a sub-form frame down to the parent rows currently in scope."""
@@ -1355,7 +1596,7 @@ df_dye  = subset_sub(df, raw_dye)
 # VIEW TOGGLE
 # ─────────────────────────────────────────────
 st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-vt_col1, vt_col2, vt_col3, vt_spacer = st.columns([1, 1, 1, 4])
+vt_col1, vt_col2, vt_col3, vt_col4, vt_spacer = st.columns([1, 1, 1, 1, 3])
 with vt_col1:
     day_btn = st.button("📅  Day Wise", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "day" else "secondary")
@@ -1365,6 +1606,9 @@ with vt_col2:
 with vt_col3:
     ledger_btn = st.button("🧾  Party Ledger", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "ledger" else "secondary")
+with vt_col4:
+    io_btn = st.button("📦  Inward/Outward", use_container_width=True,
+        type="primary" if st.session_state.get("view", "month") == "io" else "secondary")
 if day_btn:
     st.session_state["view"] = "day"
     st.rerun()
@@ -1373,6 +1617,9 @@ if month_btn:
     st.rerun()
 if ledger_btn:
     st.session_state["view"] = "ledger"
+    st.rerun()
+if io_btn:
+    st.session_state["view"] = "io"
     st.rerun()
 current_view = st.session_state.get("view", "month")
 st.divider()
@@ -2618,7 +2865,7 @@ elif current_view == "month":
 # the two is present (computed once in load_data()), and further falls back to
 # Production Date only for a lot with no chemical/dye date recorded at all.
 # ═══════════════════════════════════════════════════════════
-else:
+elif current_view == "ledger":
     ledger_valid_dates = df["Recipe Date"].dropna()
     if not ledger_valid_dates.empty:
         ledger_min_date = ledger_valid_dates.min().date()
@@ -2641,6 +2888,8 @@ else:
     ledger_chem = subset_sub(ledger_df, df_chem)
     ledger_dye  = subset_sub(ledger_df, df_dye)
     render_party_ledger_report(ledger_df, ledger_chem, ledger_dye, l_from, l_to)
+elif current_view == "io":
+    render_inward_outward_view()
 
 
 # ─────────────────────────────────────────────
