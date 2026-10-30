@@ -1655,17 +1655,17 @@ def render_machine_utilization(data):
         fig_m.add_vline(x=avg_weight, line_dash="dot", line_color="#6366f1", line_width=2, annotation_text="Avg", annotation_font_color="#6366f1")
         apply_layout(fig_m, "Machine-wise Production Weight (KG)", height=max(280, len(mach)*40), show_legend=False)
         fig_m.update_yaxes(showgrid=False); pc(fig_m)
-    if data["Production Date"].nunique() > 1:
-        heat_data = data.groupby(["M.No.", data["Production Date"].dt.strftime("%d %b")])["Weight"].sum().reset_index()
-        heat_data.columns = ["Machine", "Date", "Weight"]
-        heat_pivot = heat_data.pivot(index="Machine", columns="Date", values="Weight").fillna(0)
-        fig_heat = go.Figure(go.Heatmap(z=heat_pivot.values, x=heat_pivot.columns.tolist(), y=heat_pivot.index.tolist(),
-            colorscale=[[0,"#f9fafb"],[0.5,"#fef3c7"],[1,"#d97706"]],
-            text=[[fmt_in(int(v)) if v>0 else "" for v in row] for row in heat_pivot.values],
-            texttemplate="%{text}", textfont=dict(size=9, color="#374151"),
-            hovertemplate="Machine: %{y}<br>Date: %{x}<br>Weight: %{z} kg<extra></extra>", showscale=True))
-        apply_layout(fig_heat, "Daily Production Heatmap — Machine × Date", height=max(280, len(heat_pivot)*32), show_legend=False)
-        fig_heat.update_layout(margin=dict(l=60, r=10, t=40, b=60)); pc(fig_heat)
+    # if data["Production Date"].nunique() > 1:
+    #     heat_data = data.groupby(["M.No.", data["Production Date"].dt.strftime("%d %b")])["Weight"].sum().reset_index()
+    #     heat_data.columns = ["Machine", "Date", "Weight"]
+    #     heat_pivot = heat_data.pivot(index="Machine", columns="Date", values="Weight").fillna(0)
+    #     fig_heat = go.Figure(go.Heatmap(z=heat_pivot.values, x=heat_pivot.columns.tolist(), y=heat_pivot.index.tolist(),
+    #         colorscale=[[0,"#f9fafb"],[0.5,"#fef3c7"],[1,"#d97706"]],
+    #         text=[[fmt_in(int(v)) if v>0 else "" for v in row] for row in heat_pivot.values],
+    #         texttemplate="%{text}", textfont=dict(size=9, color="#374151"),
+    #         hovertemplate="Machine: %{y}<br>Date: %{x}<br>Weight: %{z} kg<extra></extra>", showscale=True))
+    #     apply_layout(fig_heat, "Daily Production Heatmap — Machine × Date", height=max(280, len(heat_pivot)*32), show_legend=False)
+    #     fig_heat.update_layout(margin=dict(l=60, r=10, t=40, b=60)); pc(fig_heat)
 
 
 def render_master_productivity(data):
@@ -2792,22 +2792,31 @@ elif current_view == "month":
             hovertemplate="<b>%{label}</b><br>Lots: %{value}<br>Share: %{percent}<br>Weight: %{customdata:,.0f} kg<extra></extra>"))
         apply_layout(fig_master, "Master Allocation", height=320); pc(fig_master)
 
-    c5, c6 = st.columns(2)
-    with c5:
-        lots_df = month_df.groupby("Production Date").size().reset_index(name="Lots").sort_values("Production Date")
-        avg_lots = lots_df["Lots"].mean()
-        bar_colors_lots = ["#d97706" if v >= avg_lots*1.1 else "#ef4444" if v < avg_lots*0.7 else "#f59e0b" for v in lots_df["Lots"]]
-        fig_lots = go.Figure(go.Bar(x=lots_df["Production Date"], y=lots_df["Lots"], marker_color=bar_colors_lots,
-            text=lots_df["Lots"], textposition="outside", textfont=dict(size=10, family="JetBrains Mono", color="#374151")))
-        fig_lots.add_hline(y=avg_lots, line_dash="dot", line_color="#d97706", line_width=1.5, annotation_text=f"Avg {avg_lots:.1f} lots/day", annotation_font_color="#374151", annotation_position="top right")
-        apply_layout(fig_lots, "Lots Processed Per Day", height=280, show_legend=False); pc(fig_lots)
-    with c6:
-        scatter_df = month_df.groupby("Party Name").agg(Metres=("MTRS","sum"), Weight=("Weight","sum"), Lots=("MTRS","count")).reset_index()
-        fig_scatter = px.scatter(scatter_df, x="Metres", y="Weight", size="Lots", color="Party Name",
-            color_discrete_sequence=PALETTE, text="Party Name", size_max=50,
-            hover_data={"Lots":True,"Metres":":,.0f","Weight":":,.0f"})
-        fig_scatter.update_traces(textposition="top center", textfont=dict(size=10, color="#374151"))
-        apply_layout(fig_scatter, "Metres vs Weight by Party (bubble = lots)", height=280); pc(fig_scatter)
+    # c5, c6 = st.columns(2)
+    # with c5:
+    #     lots_df = month_df.groupby("Production Date").size().reset_index(name="Lots").sort_values("Production Date")
+    #     avg_lots = lots_df["Lots"].mean()
+    #     bar_colors_lots = ["#d97706" if v >= avg_lots*1.1 else "#ef4444" if v < avg_lots*0.7 else "#f59e0b" for v in lots_df["Lots"]]
+    #     fig_lots = go.Figure(go.Bar(x=lots_df["Production Date"], y=lots_df["Lots"], marker_color=bar_colors_lots,
+    #         text=lots_df["Lots"], textposition="outside", textfont=dict(size=10, family="JetBrains Mono", color="#374151")))
+    #     fig_lots.add_hline(y=avg_lots, line_dash="dot", line_color="#d97706", line_width=1.5, annotation_text=f"Avg {avg_lots:.1f} lots/day", annotation_font_color="#374151", annotation_position="top right")
+    #     apply_layout(fig_lots, "Lots Processed Per Day", height=280, show_legend=False); pc(fig_lots)
+    # with c6:
+    #     scatter_df = month_df.groupby("Party Name").agg(Metres=("MTRS","sum"), Weight=("Weight","sum"), Lots=("MTRS","count")).reset_index()
+    #     fig_scatter = px.scatter(scatter_df, x="Metres", y="Weight", size="Lots", color="Party Name",
+    #         color_discrete_sequence=PALETTE, text="Party Name", size_max=50,
+    #         hover_data={"Lots":True,"Metres":":,.0f","Weight":":,.0f"})
+    #     fig_scatter.update_traces(textposition="top center", textfont=dict(size=10, color="#374151"))
+    #     apply_layout(fig_scatter, "Metres vs Weight by Party (bubble = lots)", height=280); pc(fig_scatter)
+
+    lots_df = month_df.groupby("Production Date").size().reset_index(name="Lots").sort_values("Production Date")
+    avg_lots = lots_df["Lots"].mean()
+    bar_colors_lots = ["#d97706" if v >= avg_lots*1.1 else "#ef4444" if v < avg_lots*0.7 else "#f59e0b" for v in lots_df["Lots"]]
+    fig_lots = go.Figure(go.Bar(x=lots_df["Production Date"], y=lots_df["Lots"], marker_color=bar_colors_lots,
+        text=lots_df["Lots"], textposition="outside", textfont=dict(size=10, family="JetBrains Mono", color="#374151")))
+    fig_lots.add_hline(y=avg_lots, line_dash="dot", line_color="#d97706", line_width=1.5, annotation_text=f"Avg {avg_lots:.1f} lots/day", annotation_font_color="#374151", annotation_position="top right")
+    apply_layout(fig_lots, "Lots Processed Per Day", height=280, show_legend=False); pc(fig_lots)
+
 
     section_divider("📋 Party-wise Summary")
     summary = month_df.groupby("Party Name").agg(Metres=("MTRS","sum"), Weight_kg=("Weight","sum"), Lots=("MTRS","count")).reset_index().sort_values("Weight_kg", ascending=False)
@@ -2817,18 +2826,18 @@ elif current_view == "month":
     rows_html = "".join(f"<tr><td>{r['Party Name']}</td><td>{fmt_in(r['Metres'])}</td><td>{fmt_in(r['Weight_kg'])}</td><td>{int(r['Lots'])}</td><td>{r['Avg KG/Lot']:.1f}</td><td>{fmt_in(r['Avg Mtrs/Lot'])}</td><td>{r['Share % (Weight)']:.1f}%</td></tr>" for _, r in summary.iterrows())
     st.markdown(f"""<div style="background:#fff;border:1px solid #e8ecf2;border-radius:14px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.05);"><table class="sum-table"><thead><tr><th>Party</th><th>Metres</th><th>Weight (kg)</th><th>Lots</th><th>Avg KG/Lot</th><th>Avg Mtrs/Lot</th><th>Share % (Weight)</th></tr></thead><tbody>{rows_html}</tbody></table></div>""", unsafe_allow_html=True)
 
-    with st.expander("🧵 Quality-wise Breakdown"):
-        q_summary = month_df.groupby(["QUALITY","SHADE"]).agg(Metres=("MTRS","sum"), Weight=("Weight","sum"), Lots=("MTRS","count")).reset_index().sort_values("Weight", ascending=False)
-        col_a, col_b = st.columns([2,1])
-        with col_a:
-            q_rows = "".join(f"<tr><td>{r['QUALITY']}</td><td>{r['SHADE']}</td><td>{fmt_in(r['Weight'])}</td><td>{fmt_in(r['Metres'])}</td><td>{int(r['Lots'])}</td></tr>" for _, r in q_summary.iterrows())
-            q_style = "<style>.q-table{width:100%;border-collapse:collapse;font-size:12px;}.q-table th{background:#f3f4f6;color:#6b7280;text-transform:uppercase;font-size:10px;letter-spacing:.06em;padding:9px 12px;border-bottom:1px solid #e5e7eb;text-align:left;font-weight:600;}.q-table td{padding:8px 12px;color:#1f2937;border-bottom:1px solid #f9fafb;font-family:'JetBrains Mono',monospace;font-size:11px;}.q-table td:first-child{color:#d97706;font-family:'Inter',sans-serif;font-weight:600;}.q-table td:nth-child(2){color:#3b82f6;font-family:'Inter',sans-serif;}.q-table tr:hover td{background:#fafafa;}</style>"
-            q_table = f'<div style="max-height:360px;overflow-y:auto;border-radius:10px;border:1px solid #e5e7eb;"><table class="q-table"><thead><tr><th>Quality</th><th>Shade</th><th>Weight (kg)</th><th>Metres</th><th>Lots</th></tr></thead><tbody>{q_rows}</tbody></table></div>'
-            st.markdown(q_style + q_table, unsafe_allow_html=True)
-        with col_b:
-            fig_qtree = px.treemap(q_summary.head(30), path=["QUALITY","SHADE"], values="Weight", color="Weight", color_continuous_scale="Oranges")
-            fig_qtree.update_layout(paper_bgcolor="rgba(255,255,255,1)", font=dict(color="#374151"), height=380, margin=dict(l=0,r=0,t=0,b=0))
-            fig_qtree.update_coloraxes(showscale=False); pc(fig_qtree)
+    # with st.expander("🧵 Quality-wise Breakdown"):
+    #     q_summary = month_df.groupby(["QUALITY","SHADE"]).agg(Metres=("MTRS","sum"), Weight=("Weight","sum"), Lots=("MTRS","count")).reset_index().sort_values("Weight", ascending=False)
+    #     col_a, col_b = st.columns([2,1])
+    #     with col_a:
+    #         q_rows = "".join(f"<tr><td>{r['QUALITY']}</td><td>{r['SHADE']}</td><td>{fmt_in(r['Weight'])}</td><td>{fmt_in(r['Metres'])}</td><td>{int(r['Lots'])}</td></tr>" for _, r in q_summary.iterrows())
+    #         q_style = "<style>.q-table{width:100%;border-collapse:collapse;font-size:12px;}.q-table th{background:#f3f4f6;color:#6b7280;text-transform:uppercase;font-size:10px;letter-spacing:.06em;padding:9px 12px;border-bottom:1px solid #e5e7eb;text-align:left;font-weight:600;}.q-table td{padding:8px 12px;color:#1f2937;border-bottom:1px solid #f9fafb;font-family:'JetBrains Mono',monospace;font-size:11px;}.q-table td:first-child{color:#d97706;font-family:'Inter',sans-serif;font-weight:600;}.q-table td:nth-child(2){color:#3b82f6;font-family:'Inter',sans-serif;}.q-table tr:hover td{background:#fafafa;}</style>"
+    #         q_table = f'<div style="max-height:360px;overflow-y:auto;border-radius:10px;border:1px solid #e5e7eb;"><table class="q-table"><thead><tr><th>Quality</th><th>Shade</th><th>Weight (kg)</th><th>Metres</th><th>Lots</th></tr></thead><tbody>{q_rows}</tbody></table></div>'
+    #         st.markdown(q_style + q_table, unsafe_allow_html=True)
+    #     with col_b:
+    #         fig_qtree = px.treemap(q_summary.head(30), path=["QUALITY","SHADE"], values="Weight", color="Weight", color_continuous_scale="Oranges")
+    #         fig_qtree.update_layout(paper_bgcolor="rgba(255,255,255,1)", font=dict(color="#374151"), height=380, margin=dict(l=0,r=0,t=0,b=0))
+    #         fig_qtree.update_coloraxes(showscale=False); pc(fig_qtree)
 
     render_raw_data(month_df)
 
