@@ -1227,9 +1227,7 @@ def load_inward_outward_data():
     return df
 
 
-def build_stock_pivot(io_df, month_start, month_end, value_col="Inward", avg_mode="calendar"):
-    """Date-rows x Party-columns pivot for one month, with a Total row/column
-    and an Avg-per-day row. Columns are ordered by total volume, descending."""
+def build_stock_pivot(io_df, month_start, month_end, value_col="Inward", avg_mode="running"):
     scope = io_df[(io_df["Date"] >= month_start) & (io_df["Date"] <= month_end)]
     if scope.empty:
         return pd.DataFrame(), [], pd.Series(dtype=float), pd.Series(dtype=float)
@@ -1245,7 +1243,20 @@ def build_stock_pivot(io_df, month_start, month_end, value_col="Inward", avg_mod
     pivot = pivot[parties]
 
     days_in_month = len(full_days)
-    if avg_mode == "entries":
+    today = pd.Timestamp.now().normalize()
+
+    if avg_mode == "running":
+        # Days elapsed so far in this month (same divisor for every party) —
+        # if the month is already over, this equals the full days_in_month.
+        if today < month_start:
+            running_days = 0
+        elif today >= month_end:
+            running_days = days_in_month
+        else:
+            running_days = (today - month_start).days + 1
+        running_days = max(running_days, 1)  # avoid divide-by-zero
+        avg_per_day = party_totals / running_days
+    elif avg_mode == "entries":
         days_with_entry = (pivot > 0).sum(axis=0).replace(0, pd.NA)
         avg_per_day = (party_totals / days_with_entry).fillna(0)
     else:  # "calendar"
@@ -1386,38 +1397,40 @@ def render_inward_outward_view():
     months = sorted(io_df["Date"].dt.to_period("M").unique(), reverse=True)
     month_labels = {m: m.strftime("%B %Y") for m in months}
 
-    c1, c2, c3 = st.columns([2, 2, 2])
+    c1, c2 = st.columns([2, 2])
     with c1:
         sel_month = st.selectbox("Month", months, format_func=lambda m: month_labels[m])
     with c2:
-        value_col = st.radio("Show", ["Inward", "Outward"], horizontal=True)
-    with c3:
-        avg_mode = st.radio("Avg/day formula (unconfirmed)",
-                             ["calendar", "entries"], horizontal=True,
-                             format_func=lambda x: "÷ calendar days" if x == "calendar" else "÷ days with entry")
+        show_choice = st.radio("Show", ["Inward", "Outward", "Both"], horizontal=True)
 
     month_start = sel_month.to_timestamp()
     month_end = month_start + pd.offsets.MonthEnd(0)
 
-    pivot, parties, totals, avg_per_day = build_stock_pivot(
-        io_df, month_start, month_end, value_col=value_col, avg_mode=avg_mode)
+    value_cols = ["Inward", "Outward"] if show_choice == "Both" else [show_choice]
 
-    if pivot.empty:
-        st.info("No data for this month."); return
+    for value_col in value_cols:
+        pivot, parties, totals, avg_per_day = build_stock_pivot(
+            io_df, month_start, month_end, value_col=value_col, avg_mode="running")
 
-    section_header("📦", f"Stock {value_col} — {month_labels[sel_month]}",
-                    "Date × Party, matching the client's sheet format")
-    render_inward_outward_html(pivot, parties, totals, avg_per_day)
+        if pivot.empty:
+            st.info(f"No {value_col} data for this month."); continue
 
-    xlsx_bytes = build_stock_excel(pivot, parties, totals, avg_per_day,
-                                    month_labels[sel_month], value_label=value_col)
-    st.download_button(
-        "⬇️ Download as Excel",
-        data=xlsx_bytes,
-        file_name=f"stock_{value_col.lower()}_{sel_month.strftime('%Y_%m')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+        section_header("📦", f"Stock {value_col} — {month_labels[sel_month]}",
+                        "Date × Party, matching the client's sheet format")
+        render_inward_outward_html(pivot, parties, totals, avg_per_day)
+
+        xlsx_bytes = build_stock_excel(pivot, parties, totals, avg_per_day,
+                                        month_labels[sel_month], value_label=value_col)
+        st.download_button(
+            f"⬇️ Download {value_col} as Excel",
+            data=xlsx_bytes,
+            file_name=f"stock_{value_col.lower()}_{sel_month.strftime('%Y_%m')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"dl_{value_col}",
+        )
+        if len(value_cols) > 1:
+            st.divider()
 
 def subset_sub(parent_df, sub_df):
     """Filter a sub-form frame down to the parent rows currently in scope."""
@@ -2150,8 +2163,10 @@ def render_dye_cost(data, dye):
         rows = ""
         for i, r in g.iterrows():
             badge = ["🥇","🥈","🥉"][i] if i < 3 else f"#{i+1}"
-            rows += f"<tr><td>{badge}</td><td>{r['Item']}</td><td>{fmt_cur(r['Cost'])}</td><td>₹{r['AvgRate']:.1f}</td><td>{r['Share %']:.1f}%</td></tr>"
-        st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;max-height:360px;overflow-y:auto;"><table class="leaderboard-table"><thead><tr><th>Rank</th><th>Dye</th><th>Cost</th><th>Avg Rate/Kg</th><th>Share</th></tr></thead><tbody>{rows}</tbody></table></div>""", unsafe_allow_html=True)
+            qty_kg = r["Qty"] / 1000
+            rows += f"<tr><td>{badge}</td><td>{r['Item']}</td><td>{qty_kg:,.2f} kg</td><td>{fmt_cur(r['Cost'])}</td><td>₹{r['AvgRate']:.1f}</td><td>{r['Share %']:.1f}%</td></tr>"
+        st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;max-height:360px;overflow-y:auto;"><table class="leaderboard-table"><thead><tr><th>Rank</th><th>Dye</th><th>Qty (kg)</th><th>Cost</th><th>Avg Rate/Kg</th><th>Share</th></tr></thead><tbody>{rows}</tbody></table></div>""", unsafe_allow_html=True)
+    
     # ── Dye distribution pie (by cost/amount share), mirrors Chemical Distribution ──
     top_dye_dist = g.head(10).copy()
     others = g.iloc[10:]
@@ -2170,18 +2185,18 @@ def render_dye_cost(data, dye):
     apply_layout(fig_dye_pie, "Dye Distribution (by Cost Share)", height=320)
     pc(fig_dye_pie)
     # dye usage by shade
-    if "SHADE" in dye.columns:
-        top_dyes = g["Item"].head(8).tolist()
-        ds = dye[dye["Item"].isin(top_dyes)].groupby(["SHADE","Item"])["Cost"].sum().reset_index()
-        if not ds.empty:
-            piv = ds.pivot(index="SHADE", columns="Item", values="Cost").fillna(0)
-            piv = piv.loc[piv.sum(axis=1).nlargest(15).index]
-            fig_hm = go.Figure(go.Heatmap(z=piv.values, x=piv.columns.tolist(), y=piv.index.tolist(),
-                colorscale=[[0,"#faf5ff"],[0.5,"#c4b5fd"],[1,"#7c3aed"]],
-                text=[[fmt_in(int(v)) for v in row] for row in piv.values], texttemplate="%{text}", textfont=dict(size=9),
-                hovertemplate="Shade: %{y}<br>Dye: %{x}<br>Cost: ₹%{z}<extra></extra>", showscale=True))
-            apply_layout(fig_hm, "Top Shades × Dye Cost (₹)", height=max(300, len(piv)*28), show_legend=False)
-            fig_hm.update_layout(margin=dict(l=100, r=10, t=40, b=60)); pc(fig_hm)
+    # if "SHADE" in dye.columns:
+    #     top_dyes = g["Item"].head(8).tolist()
+    #     ds = dye[dye["Item"].isin(top_dyes)].groupby(["SHADE","Item"])["Cost"].sum().reset_index()
+    #     if not ds.empty:
+    #         piv = ds.pivot(index="SHADE", columns="Item", values="Cost").fillna(0)
+    #         piv = piv.loc[piv.sum(axis=1).nlargest(15).index]
+    #         fig_hm = go.Figure(go.Heatmap(z=piv.values, x=piv.columns.tolist(), y=piv.index.tolist(),
+    #             colorscale=[[0,"#faf5ff"],[0.5,"#c4b5fd"],[1,"#7c3aed"]],
+    #             text=[[fmt_in(int(v)) for v in row] for row in piv.values], texttemplate="%{text}", textfont=dict(size=9),
+    #             hovertemplate="Shade: %{y}<br>Dye: %{x}<br>Cost: ₹%{z}<extra></extra>", showscale=True))
+    #         apply_layout(fig_hm, "Top Shades × Dye Cost (₹)", height=max(300, len(piv)*28), show_legend=False)
+    #         fig_hm.update_layout(margin=dict(l=100, r=10, t=40, b=60)); pc(fig_hm)
     top = g.iloc[0]
     insight_card(f"<strong>{top['Item']}</strong> drives {top['Share %']:.1f}% of dye spend ({fmt_cur(top['Cost'])}). A small rate cut here moves the total — prioritise this supplier negotiation.", kind="info")
 
@@ -2619,37 +2634,37 @@ if current_view == "day":
     render_executive_snapshot(day_df, full=df, label=sel_day.strftime("%d %B %Y"))
 
     st.divider()
-    st.markdown("#### 📋 Lot-wise Production Sheet")
-    cost_cols = [c for c in ["Total Dye Cost","Total Chemical Cost","Total Cost"] if c in day_df.columns and HAS_COST]
-    display_cols = ["LOT NO.","Party Name","QUALITY","SHADE","SIZE","M.No.","MTRS","Weight"] + cost_cols + ["Business Type","MASTER NAME"]
-    display_cols = [c for c in display_cols if c in day_df.columns]
-    sheet_df = day_df[display_cols].copy().reset_index(drop=True); sheet_df.index = sheet_df.index + 1
-    headers_html = "".join(f"<th>{c}</th>" for c in display_cols)
-    money_cols = set(["Total Dye Cost","Total Chemical Cost","Total Cost"])
-    rows_html_sheet = ""
-    for i, row in sheet_df.iterrows():
-        cells = ""
-        for col in display_cols:
-            if col in ["MTRS","Weight"]:
-                cells += f"<td><b>{fmt_in(row[col])}</b></td>"
-            elif col in money_cols:
-                cells += f"<td>{fmt_cur(row[col])}</td>"
-            else:
-                cells += f"<td>{row[col]}</td>"
-        rows_html_sheet += f"<tr><td><b>{i}</b></td>{cells}</tr>"
-    total_cells = ""
-    for col in display_cols:
-        if col in ["MTRS","Weight"]:
-            total_cells += f"<td><b>{fmt_in(day_df[col].sum())}</b></td>"
-        elif col in money_cols:
-            total_cells += f"<td><b>{fmt_cur(day_df[col].sum())}</b></td>"
-        elif col == "LOT NO.":
-            total_cells += "<td><b>TOTAL</b></td>"
-        else:
-            total_cells += "<td>—</td>"
-    st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:16px;"><table class="prod-sheet-table">
-      <thead><tr><th>#</th>{headers_html}</tr></thead>
-      <tbody>{rows_html_sheet}<tr class="prod-sheet-total"><td><b>∑</b></td>{total_cells}</tr></tbody></table></div>""", unsafe_allow_html=True)
+    # st.markdown("#### 📋 Lot-wise Production Sheet")
+    # cost_cols = [c for c in ["Total Dye Cost","Total Chemical Cost","Total Cost"] if c in day_df.columns and HAS_COST]
+    # display_cols = ["LOT NO.","Party Name","QUALITY","SHADE","SIZE","M.No.","MTRS","Weight"] + cost_cols + ["Business Type","MASTER NAME"]
+    # display_cols = [c for c in display_cols if c in day_df.columns]
+    # sheet_df = day_df[display_cols].copy().reset_index(drop=True); sheet_df.index = sheet_df.index + 1
+    # headers_html = "".join(f"<th>{c}</th>" for c in display_cols)
+    # money_cols = set(["Total Dye Cost","Total Chemical Cost","Total Cost"])
+    # rows_html_sheet = ""
+    # for i, row in sheet_df.iterrows():
+    #     cells = ""
+    #     for col in display_cols:
+    #         if col in ["MTRS","Weight"]:
+    #             cells += f"<td><b>{fmt_in(row[col])}</b></td>"
+    #         elif col in money_cols:
+    #             cells += f"<td>{fmt_cur(row[col])}</td>"
+    #         else:
+    #             cells += f"<td>{row[col]}</td>"
+    #     rows_html_sheet += f"<tr><td><b>{i}</b></td>{cells}</tr>"
+    # total_cells = ""
+    # for col in display_cols:
+    #     if col in ["MTRS","Weight"]:
+    #         total_cells += f"<td><b>{fmt_in(day_df[col].sum())}</b></td>"
+    #     elif col in money_cols:
+    #         total_cells += f"<td><b>{fmt_cur(day_df[col].sum())}</b></td>"
+    #     elif col == "LOT NO.":
+    #         total_cells += "<td><b>TOTAL</b></td>"
+    #     else:
+    #         total_cells += "<td>—</td>"
+    # st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:16px;"><table class="prod-sheet-table">
+    #   <thead><tr><th>#</th>{headers_html}</tr></thead>
+    #   <tbody>{rows_html_sheet}<tr class="prod-sheet-total"><td><b>∑</b></td>{total_cells}</tr></tbody></table></div>""", unsafe_allow_html=True)
 
     st.divider()
     dc1, dc2 = st.columns(2)
