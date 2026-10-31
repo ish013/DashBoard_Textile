@@ -1544,18 +1544,24 @@ all_shades  = sorted(raw["SHADE"].dropna().unique())
 all_masters = sorted(raw["MASTER NAME"].dropna().unique())
 all_biztypes = sorted(raw["Business Type"].dropna().unique())
 
+# Read the current view early (it's already in session_state from the last
+# button click) so the filter bar can hide fields that don't apply to
+# Inward/Outward (which only has Date + Party — no Quality/Shade/Master/Business Type).
+_view_for_filters = st.session_state.get("view", "month")
+is_io_view = (_view_for_filters == "io")
+
 with st.expander("🔍  Filters — click to expand", expanded=False):
     st.markdown("<div class='filter-bar-title'>Filter the data below</div>", unsafe_allow_html=True)
 
-    # Versioned widget keys: bumping this counter on "Reset All" forces Streamlit to
-    # throw away the old multiselect/date-input components and mount brand-new ones
-    # with clean defaults, instead of reusing the same key (which can leave the
-    # on-screen pills showing stale selections even though the underlying data reset).
     if "filter_reset_ctr" not in st.session_state:
         st.session_state["filter_reset_ctr"] = 0
     _rv = st.session_state["filter_reset_ctr"]
 
-    fc1, fc2, fc3, fc4, fc5 = st.columns([2, 2, 2, 2, 2])
+    if is_io_view:
+        fc1, fc2 = st.columns([2, 2])
+    else:
+        fc1, fc2, fc3, fc4, fc5 = st.columns([2, 2, 2, 2, 2])
+
     with fc1:
         st.markdown("**📅 Date Range**")
         date_range = st.date_input("date_range", value=(min_date, max_date),
@@ -1563,20 +1569,29 @@ with st.expander("🔍  Filters — click to expand", expanded=False):
     with fc2:
         st.markdown("**🏭 Party**")
         sel_parties = st.multiselect("Party", all_parties, default=all_parties, label_visibility="collapsed", key=f"filter_parties_{_rv}")
-    with fc3:
-        st.markdown("**🧵 Quality**")
-        sel_quality = st.multiselect("Quality", all_quality, default=all_quality, label_visibility="collapsed", key=f"filter_quality_{_rv}")
-    with fc4:
-        st.markdown("**🎨 Shade**")
-        sel_shades = st.multiselect("Shade", all_shades, default=all_shades, label_visibility="collapsed", key=f"filter_shades_{_rv}")
-    with fc5:
-        st.markdown("**👤 Master**")
-        sel_masters = st.multiselect("Master", all_masters, default=all_masters, label_visibility="collapsed", key=f"filter_masters_{_rv}")
+
+    if is_io_view:
+        # Not applicable to Inward/Outward — default to "no filter" so later code still works
+        sel_quality  = all_quality
+        sel_shades   = all_shades
+        sel_masters  = all_masters
+        sel_biztypes = all_biztypes
+    else:
+        with fc3:
+            st.markdown("**🧵 Quality**")
+            sel_quality = st.multiselect("Quality", all_quality, default=all_quality, label_visibility="collapsed", key=f"filter_quality_{_rv}")
+        with fc4:
+            st.markdown("**🎨 Shade**")
+            sel_shades = st.multiselect("Shade", all_shades, default=all_shades, label_visibility="collapsed", key=f"filter_shades_{_rv}")
+        with fc5:
+            st.markdown("**👤 Master**")
+            sel_masters = st.multiselect("Master", all_masters, default=all_masters, label_visibility="collapsed", key=f"filter_masters_{_rv}")
 
     fb1, fb2, fb3 = st.columns([2, 6, 1])
-    with fb1:
-        st.markdown("**🏷️ Business Type**")
-        sel_biztypes = st.multiselect("Business Type", all_biztypes, default=all_biztypes, label_visibility="collapsed", key=f"filter_biztypes_{_rv}")
+    if not is_io_view:
+        with fb1:
+            st.markdown("**🏷️ Business Type**")
+            sel_biztypes = st.multiselect("Business Type", all_biztypes, default=all_biztypes, label_visibility="collapsed", key=f"filter_biztypes_{_rv}")
     with fb3:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
         if st.button("↩️ Reset All", use_container_width=True):
