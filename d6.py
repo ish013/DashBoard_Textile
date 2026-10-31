@@ -1394,6 +1394,14 @@ def render_inward_outward_view():
         st.warning("⚠️ No Inward/Outward records found."); return
 
     io_df = io_df.dropna(subset=["Date"])
+
+    # Apply the same Party Name filter used by the other views
+    if sel_parties:
+        io_df = io_df[io_df["Party Name"].isin(sel_parties)]
+
+    if io_df.empty:
+        st.info("No Inward/Outward data for the selected party filter."); return
+
     months = sorted(io_df["Date"].dt.to_period("M").unique(), reverse=True)
     month_labels = {m: m.strftime("%B %Y") for m in months}
 
