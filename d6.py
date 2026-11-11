@@ -1539,8 +1539,8 @@ FACTORY_REPORT_GROUPS = {
             ]),
         ],
     },
-    "compressor": {
-        "title": "🌀 Compressor",
+    "compressor_summersible": {
+        "title": "🌀 Compressor & Summersible",
         "blocks": [
             ("COMPRESSOR", [
                 ("compressor_hour", "HOUR", "sum"),
@@ -1548,11 +1548,6 @@ FACTORY_REPORT_GROUPS = {
                 ("compressor_per_hour_avg", "PER HOUR AVG", "avg"),
                 ("compressor_total_ampere", "TOTAL AMPERE", "sum"),
             ]),
-        ],
-    },
-    "summersible": {
-        "title": "💧 Summersible",
-        "blocks": [
             ("SUMMERSIBLE", [
                 ("summersible_hour", "HOUR", "sum"),
                 ("summersible_unit", "UNIT", "sum"),
