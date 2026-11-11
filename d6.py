@@ -1801,6 +1801,13 @@ def _factory_total_row(grid, aggs):
 
 
 def _factory_fmt_cell(v):
+    if v is None:
+        return "—"
+    try:
+        if pd.isna(v):
+            return "—"
+    except (TypeError, ValueError):
+        pass
     try:
         v = float(v)
     except Exception:
@@ -1810,7 +1817,11 @@ def _factory_fmt_cell(v):
     return f"{v:,.0f}" if abs(v - round(v)) < 1e-9 else f"{v:,.2f}"
 
 
-def render_factory_group_html(grid, aggs):
+def render_factory_group_html(grid, totals):
+    """grid: DataFrame indexed by day with MultiIndex (equipment_label, column_label)
+    columns. totals: dict mapping each column to its precomputed TOTAL-row value
+    (None/NaN is rendered blank) — computed by _factory_total_row or
+    _electrical_total_row depending on the report type."""
     equip_spans = []
     for c in grid.columns:
         if not equip_spans or equip_spans[-1][0] != c[0]:
@@ -1826,8 +1837,7 @@ def render_factory_group_html(grid, aggs):
         cells = "".join(f"<td>{_factory_fmt_cell(row[c])}</td>" for c in grid.columns)
         rows_html += f"<tr><td><b>{day}</b></td>{cells}</tr>"
 
-    totals = _factory_total_row(grid, aggs)
-    total_cells = "".join(f"<td><b>{_factory_fmt_cell(totals[c])}</b></td>" for c in grid.columns)
+    total_cells = "".join(f"<td><b>{_factory_fmt_cell(totals.get(c))}</b></td>" for c in grid.columns)
 
     st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:20px;">
       <table class="prod-sheet-table"><thead><tr>{top_header}</tr><tr>{sub_header}</tr></thead>
@@ -1835,8 +1845,27 @@ def render_factory_group_html(grid, aggs):
       unsafe_allow_html=True)
 
 
+def _xlsx_num(v):
+    """None/NaN -> None (blank cell); else a plain rounded float for openpyxl."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return round(float(v), 2)
+    except Exception:
+        return None
+
+
 def build_factory_excel(grids_dict, month_label):
-    """grids_dict: {sheet_title: (grid, aggs)} — one sheet per selected report."""
+    """grids_dict: {sheet_title: (grid, totals)} — one sheet per selected report.
+    `grid` is day-indexed with MultiIndex (equipment_label, column_label) columns;
+    `totals` is a dict of the same columns -> precomputed TOTAL-row value (or
+    None/NaN for a blank cell, e.g. a cumulative Reading column with no sensible
+    total)."""
     wb = Workbook()
     wb.remove(wb.active)
     navy_fill   = PatternFill("solid", fgColor="1E3A5F")
@@ -1847,7 +1876,7 @@ def build_factory_excel(grids_dict, month_label):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center")
 
-    for sheet_title, (grid, aggs) in grids_dict.items():
+    for sheet_title, (grid, totals) in grids_dict.items():
         safe_title = re.sub(r"[^\w\s-]", "", sheet_title).strip()[:31] or "Sheet"
         ws = wb.create_sheet(title=safe_title)
         n_cols = len(grid.columns) + 1
@@ -1888,17 +1917,16 @@ def build_factory_excel(grids_dict, month_label):
         for day, row_vals in grid.iterrows():
             ws.cell(row=r, column=1, value=day).font = bold
             for i, c in enumerate(grid.columns, start=2):
-                ws.cell(row=r, column=i, value=round(float(row_vals[c]), 2))
+                ws.cell(row=r, column=i, value=_xlsx_num(row_vals[c]))
             for cc in range(1, n_cols + 1):
                 ws.cell(row=r, column=cc).border = border
                 ws.cell(row=r, column=cc).alignment = center
             r += 1
 
-        totals = _factory_total_row(grid, aggs)
         ws.cell(row=r, column=1, value="TOTAL").font = bold
         ws.cell(row=r, column=1).fill = yellow_fill
         for i, c in enumerate(grid.columns, start=2):
-            cell = ws.cell(row=r, column=i, value=round(totals[c], 2))
+            cell = ws.cell(row=r, column=i, value=_xlsx_num(totals.get(c)))
             cell.fill = yellow_fill; cell.font = bold
         for cc in range(1, n_cols + 1):
             ws.cell(row=r, column=cc).border = border
@@ -1914,8 +1942,184 @@ def build_factory_excel(grids_dict, month_label):
     return buf.getvalue()
 
 
+# ═══════════════════════════════════════════════════════════
+# ELECTRICAL  (separate Zoho report: "Electrical_Report")
+# LS Meter / LS Energy Meter / MDI / Colony / Solar / Drain Water — day-wise
+# meter log. Unlike the other 4 Factory Sheet reports, this one stores only a
+# cumulative METER READING per meter (confirmed live against Zoho), not a
+# per-day "Unit" value — Unit is a derived figure: this entry's reading minus
+# the immediately preceding entry's reading (same logic as reading a physical
+# electricity/water meter), confirmed with the client using a live data
+# example on 2026-11-11. A day with no Zoho entry shows blank, and the next
+# entry that *does* exist absorbs the whole gap as a single Unit value rather
+# than splitting it across the skipped days (matches their paper register).
+# ═══════════════════════════════════════════════════════════
+
+ELECTRICAL_GROUP_KEY = "electrical"
+ELECTRICAL_GROUP_TITLE = "⚡ Electrical"
+
+# Verified exact Zoho API link names (confirmed live against "Electrical_Report" on 2026-11-11).
+ELECTRICAL_FIELD_LINKNAMES = {
+    "date": "Date_field",
+    "ls_reading": "LS_Reading",
+    "ls_em_reading": "LS_ENERGY_METER_Reading",
+    "mdi": "MDI",
+    "colony_reading": "Colony_Reading",
+    "solar_reading": "Solar_Reading",
+    "drain_water_reading": "Drain_Water_Reading",
+}
+# Human labels, used only as a fuzzy-match fallback if a verified link name
+# above isn't found in what Zoho actually returns (schema drift safety net).
+ELECTRICAL_FIELD_LABELS = {
+    "date": "Date",
+    "ls_reading": "LS Reading",
+    "ls_em_reading": "LS Energy Meter Reading",
+    "mdi": "MDI",
+    "colony_reading": "Colony Reading",
+    "solar_reading": "Solar Reading",
+    "drain_water_reading": "Drain Water Reading",
+}
+
+
+@st.cache_data(ttl=900, show_spinner="Loading Electrical data…")
+def load_electrical_data():
+    """Fetch the Electrical_Report (LS Meter / LS Energy Meter / MDI / Colony /
+    Solar / Drain Water). Returns (df, diag) — df has one row per Zoho record
+    with columns Date, ls_reading, ls_em_reading, mdi, colony_reading,
+    solar_reading, drain_water_reading (raw readings — Unit is computed later,
+    per-month, by build_electrical_grid)."""
+    cfg    = st.secrets["zoho_creator"]
+    owner  = cfg.get("factory_account_owner", "founder_in0")
+    app    = cfg.get("factory_app_name", "data-analytics")
+    report = cfg.get("electrical_report_name", "Electrical_Report")
+    token  = get_access_token()
+
+    base_url = f"https://creator.zoho.in/api/v2/{owner}/{app}/report/{report}"
+    headers  = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+    all_records = []
+    start, limit = 0, 200
+    try:
+        while True:
+            resp = requests.get(base_url, headers=headers,
+                                 params={"from": start, "limit": limit, "field_config": "all"},
+                                 timeout=20)
+            if resp.status_code != 200:
+                return pd.DataFrame(), {"error": f"HTTP {resp.status_code}: {resp.text[:300]}"}
+            recs = resp.json().get("data", [])
+            if not recs:
+                break
+            all_records.extend(recs)
+            if len(recs) < limit:
+                break
+            start += limit
+    except Exception as e:
+        return pd.DataFrame(), {"error": str(e)}
+
+    if not all_records:
+        return pd.DataFrame(), {"error": None}
+
+    sample = all_records[0]
+    raw_keys = [k for k in sample.keys() if k not in ("ID", "id")]
+    raw_key_set = set(raw_keys)
+    norm_to_actual = {}
+    for k in raw_keys:
+        norm_to_actual.setdefault(_norm_key(k), k)
+
+    resolved = {}
+    for logical_key, label in ELECTRICAL_FIELD_LABELS.items():
+        verified = ELECTRICAL_FIELD_LINKNAMES.get(logical_key)
+        actual = verified if verified in raw_key_set else norm_to_actual.get(_norm_key(label))
+        resolved[logical_key] = actual
+
+    date_key = resolved.get("date")
+    rows = []
+    for rec in all_records:
+        row = {"Date": dv(rec.get(date_key)) if date_key else None}
+        for logical_key, actual in resolved.items():
+            if logical_key == "date":
+                continue
+            row[logical_key] = _to_num(dv(rec.get(actual))) if actual else None
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df["Date"] = parse_dates(df["Date"])
+    return df, {"error": None, "records": len(all_records)}
+
+
+def build_electrical_grid(edf, month_start, month_end):
+    """Returns (grid, kinds). `edf` must already be sorted ascending by Date with
+    one row per date (deduped) covering history before month_start too, so the
+    first day of the month can diff against the last reading of the PRIOR
+    month rather than showing a false blank — matches the client's own example
+    ("1 July's Unit = 1 July reading − 30 June reading").
+    `kinds` maps each column to "reading" (cumulative, shown as-is),
+    "unit" (derived day-to-day consumption, summed in the TOTAL row), or
+    "direct" (a standalone instantaneous value like MDI, maxed in the TOTAL row)."""
+    edf = edf.dropna(subset=["Date"]).sort_values("Date").drop_duplicates(subset="Date", keep="last").reset_index(drop=True)
+
+    reading_to_unit = {
+        "ls_reading": "ls_unit",
+        "ls_em_reading": "ls_em_unit",
+        "colony_reading": "colony_unit",
+        "solar_reading": "solar_unit",
+        "drain_water_reading": "drainwater_unit",
+    }
+    for rcol, ucol in reading_to_unit.items():
+        edf[ucol] = edf[rcol].diff()
+
+    days_in_month = (month_end - month_start).days + 1
+    scope = edf[(edf["Date"] >= month_start) & (edf["Date"] <= month_end)].copy()
+    scope["Day"] = scope["Date"].dt.day
+    by_day = scope.set_index("Day")
+
+    # (equipment_label, [(data_key, column_label, kind), ...])
+    col_specs = [
+        ("LS (METER)", [("ls_reading", "READING", "reading"), ("ls_unit", "UNIT", "unit")]),
+        ("LS (ENERGY MTR)", [("ls_em_reading", "READING", "reading"), ("ls_em_unit", "UNIT", "unit")]),
+        ("MDI", [("mdi", "", "direct")]),
+        ("COLONY", [("colony_reading", "READING", "reading"), ("colony_unit", "UNIT", "unit")]),
+        ("SOLAR", [("solar_unit", "UNIT", "unit")]),
+        ("DRAIN WATER", [("drainwater_unit", "UNIT", "unit")]),
+    ]
+
+    grid = pd.DataFrame(index=range(1, days_in_month + 1))
+    kinds = {}
+    for equip_label, cols in col_specs:
+        for key, label, kind in cols:
+            col = (equip_label, label)
+            if key in by_day.columns:
+                series = by_day[key].reindex(range(1, days_in_month + 1))
+            else:
+                series = pd.Series([None] * days_in_month, index=range(1, days_in_month + 1), dtype="float64")
+            grid[col] = series
+            kinds[col] = kind
+    grid.columns = pd.MultiIndex.from_tuples(grid.columns)
+    return grid, kinds
+
+
+def _electrical_total_row(grid, kinds):
+    """TOTAL row: sum of the month's derived Unit values for 'unit' columns
+    (total consumption for the month), max for 'direct' (MDI = peak demand),
+    and the last known reading of the month for 'reading' columns (a running
+    cumulative column has no sensible sum)."""
+    out = {}
+    for c in grid.columns:
+        series = grid[c].dropna()
+        kind = kinds[c]
+        if not len(series):
+            out[c] = None
+        elif kind == "unit":
+            out[c] = float(series.sum())
+        elif kind == "direct":
+            out[c] = float(series.max())
+        else:  # "reading" — closing reading for the month
+            out[c] = float(series.iloc[-1])
+    return out
+
+
 def render_factory_sheet_view():
-    section_header("🏭", "Factory Sheets", "Boiler · Dyeing · Stenter · Compressor · Summersible — day-wise, from Zoho")
+    section_header("🏭", "Factory Sheets", "Boiler · Dyeing · Stenter · Compressor · Summersible · Electrical — day-wise, from Zoho")
 
     fdf, fdiag = load_factory_sheet_data()
     if fdiag.get("error"):
@@ -1936,7 +2140,15 @@ def render_factory_sheet_view():
     if fdf.empty:
         st.info("No dated records in the Factory Sheet report."); return
 
-    months = sorted(fdf["Date"].dt.to_period("M").unique(), reverse=True)
+    # Electrical lives in its own Zoho report — load it leniently so a problem
+    # there doesn't take down the other 3 reports.
+    edf, ediag = load_electrical_data()
+    electrical_ok = not ediag.get("error") and not edf.empty
+    if ediag.get("error"):
+        st.caption(f"⚡ Electrical report unavailable right now ({ediag['error']}) — other reports below are unaffected.")
+
+    all_dates = fdf["Date"] if not electrical_ok else pd.concat([fdf["Date"], edf.dropna(subset=["Date"])["Date"]])
+    months = sorted(all_dates.dt.to_period("M").unique(), reverse=True)
     month_labels = {m: m.strftime("%B %Y") for m in months}
 
     fc1, fc2 = st.columns([2, 4])
@@ -1946,6 +2158,8 @@ def render_factory_sheet_view():
     month_end = month_start + pd.offsets.MonthEnd(0)
 
     group_options = {v["title"]: k for k, v in FACTORY_REPORT_GROUPS.items()}
+    if electrical_ok:
+        group_options[ELECTRICAL_GROUP_TITLE] = ELECTRICAL_GROUP_KEY
     with fc2:
         sel_titles = st.multiselect("📋 Reports to show (pick any / all)", list(group_options.keys()),
             default=list(group_options.keys()), key="factory_reports_sel")
@@ -1956,11 +2170,16 @@ def render_factory_sheet_view():
     grids = {}
     for title in sel_titles:
         gkey = group_options[title]
-        blocks = FACTORY_REPORT_GROUPS[gkey]["blocks"]
-        grid, aggs = build_factory_group_table(fdf, month_start, month_end, blocks)
-        grids[title] = (grid, aggs)
+        if gkey == ELECTRICAL_GROUP_KEY:
+            grid, kinds = build_electrical_grid(edf, month_start, month_end)
+            totals = _electrical_total_row(grid, kinds)
+        else:
+            blocks = FACTORY_REPORT_GROUPS[gkey]["blocks"]
+            grid, aggs = build_factory_group_table(fdf, month_start, month_end, blocks)
+            totals = _factory_total_row(grid, aggs)
+        grids[title] = (grid, totals)
         section_divider(f"{title} — {month_labels[sel_month]}")
-        render_factory_group_html(grid, aggs)
+        render_factory_group_html(grid, totals)
 
     xlsx_bytes = build_factory_excel(grids, month_labels[sel_month])
     st.download_button(
