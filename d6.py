@@ -1440,6 +1440,544 @@ def render_inward_outward_view():
         if len(value_cols) > 1:
             st.divider()
 
+
+# ═══════════════════════════════════════════════════════════
+# FACTORY SHEETS  (NEW — additive only)
+# Boiler / Dyeing / Stenter / Compressor / Summersible daily log, matching the
+# client's paper "SF - Factory Sheets" register: one row per day-of-month
+# (1..days_in_month) + a bold TOTAL row, split into 4 grouped tables —
+# Dyeing Data Analysis, Stenter Data Analysis, Compressor, Summersible —
+# each with the same 2-row grouped header style as the paper sheet.
+#
+# Lives in a separate Zoho Creator report ("All_Tests" in the "data-analytics"
+# app, per the client's URL) — NOT the same report as Production Entry.
+# Override the owner/app/report via secrets.toml if these ever change:
+#   [zoho_creator]
+#   factory_account_owner = "founder_in0"
+#   factory_app_name      = "data-analytics"
+#   factory_report_name   = "All_Tests"
+#
+# Field-name matching: rather than hard-coding Zoho's internal API link names
+# (which we can't verify without live access to that report), every expected
+# column is matched against whatever field keys Zoho actually returns, by
+# normalizing both sides (lowercase, strip all non-alphanumerics) and
+# comparing. A couple of known spelling variants (Bolier/Boiler,
+# Summersible/Submersible) are tried as fallbacks. Anything that still can't
+# be matched shows up in the "Field mapping diagnostic" expander with the raw
+# field names Zoho actually sent, so a mismatch is a quick fix rather than a
+# silent wrong number.
+# ═══════════════════════════════════════════════════════════
+
+# Every field from the Zoho form, grouped exactly like the paper register.
+# (equipment_label, [(logical_key, column_label, agg), ...])  agg: "sum" for
+# raw counters (hour/unit/ampere/prod/water/lot/conv), "avg" for computed
+# ratio/percentage/average fields.
+FACTORY_REPORT_GROUPS = {
+    "dyeing": {
+        "title": "🎨 Dyeing Data Analysis",
+        "blocks": [
+            ("BOILER", [
+                ("boiler_hour", "HOUR", "sum"),
+                ("boiler_conv", "CONV.", "sum"),
+                ("boiler_percentage", "%", "avg"),
+                ("boiler_water", "WATER", "sum"),
+            ]),
+            ("BOILER (ELECTRICAL)", [
+                ("boiler_elec_unit", "UNIT", "sum"),
+                ("boiler_elec_per_hour_avg", "PER HOUR AVG", "avg"),
+                ("boiler_elec_total_ampere", "TOTAL AMPERE", "sum"),
+            ]),
+            ("DYEING", [
+                ("dyeing_prod", "D.PROD", "sum"),
+                ("dyeing_lot", "LOT", "sum"),
+                ("dyeing_water", "WATER", "sum"),
+                ("dyeing_lr", "LR", "avg"),
+            ]),
+            ("DYEING A (ELECTRICAL)", [
+                ("dyeing_a_unit", "UNIT", "sum"),
+                ("dyeing_a_total_ampere", "TOTAL AMPERE", "sum"),
+            ]),
+            ("DYEING B (ELECTRICAL)", [
+                ("dyeing_b_unit", "UNIT", "sum"),
+                ("dyeing_b_total_ampere", "TOTAL AMPERE", "sum"),
+            ]),
+        ],
+    },
+    "stenter": {
+        "title": "🧵 Stenter Data Analysis",
+        "blocks": [
+            ("THERMOPACK", [
+                ("thermopack_hour", "HOUR", "sum"),
+                ("thermopack_conv", "CONV.", "sum"),
+                ("thermopack_percentage", "%", "avg"),
+            ]),
+            ("ELECTRICAL", [
+                ("electrical_unit", "UNIT", "sum"),
+                ("electrical_per_hour_avg", "PER HOUR AVG", "avg"),
+                ("electrical_total_ampere", "TOTAL AMPERE", "sum"),
+            ]),
+            ("STENMECH", [
+                ("stenmech_hours", "HOURS", "sum"),
+                ("stenmech_unit", "UNIT", "sum"),
+                ("stenmech_prod", "D.PROD", "sum"),
+                ("stenmech_avg_prod", "AVG PROD", "avg"),
+                ("stenmech_per_hour_avg", "AVG PER HOUR", "avg"),
+            ]),
+            ("LUCY", [
+                ("lucy_hours", "HOURS", "sum"),
+                ("lucy_unit", "UNIT", "sum"),
+                ("lucy_prod", "D.PROD", "sum"),
+                ("lucy_avg_prod", "AVG PROD", "avg"),
+                ("lucy_avg_per_hour", "AVG PER HOUR", "avg"),
+            ]),
+            ("HARISH", [
+                ("harish_hours", "HOURS", "sum"),
+                ("harish_unit", "UNIT", "sum"),
+                ("harish_prod", "D.PROD", "sum"),
+                ("harish_avg_prod", "AVG PROD", "avg"),
+                ("harish_per_hour_avg", "AVG PER HOUR", "avg"),
+            ]),
+        ],
+    },
+    "compressor": {
+        "title": "🌀 Compressor",
+        "blocks": [
+            ("COMPRESSOR", [
+                ("compressor_hour", "HOUR", "sum"),
+                ("compressor_unit", "UNIT", "sum"),
+                ("compressor_per_hour_avg", "PER HOUR AVG", "avg"),
+                ("compressor_total_ampere", "TOTAL AMPERE", "sum"),
+            ]),
+        ],
+    },
+    "summersible": {
+        "title": "💧 Summersible",
+        "blocks": [
+            ("SUMMERSIBLE", [
+                ("summersible_hour", "HOUR", "sum"),
+                ("summersible_unit", "UNIT", "sum"),
+                ("summersible_per_hour_avg", "PER HOUR AVG", "avg"),
+                ("summersible_total_ampere", "TOTAL AMPERE", "sum"),
+            ]),
+        ],
+    },
+}
+
+# Flat logical_key -> expected Zoho display label, used for fuzzy field matching.
+# Hand-written to match the exact labels in the Zoho form designer (from the
+# client's screenshots) rather than guessed, since Zoho's auto-generated API
+# link names don't always follow a predictable pattern from the label alone.
+FACTORY_FIELD_LABELS = {"date": "Date"}
+FACTORY_FIELD_LABELS.update({
+    "boiler_hour": "Bolier Hour",
+    "boiler_conv": "Bolier Conv",
+    "boiler_percentage": "Bolier Percentage",
+    "boiler_water": "Bolier Water",
+    "boiler_elec_unit": "Bolier(Electrical) Unit",
+    "boiler_elec_per_hour_avg": "Bolier(Electrical) Per Hour Avg",
+    "boiler_elec_total_ampere": "Bolier(Electrical) Total Ampere",
+    "dyeing_prod": "Dyeing Prod",
+    "dyeing_lot": "Dyeing Lot",
+    "dyeing_water": "Dyeing Water",
+    "dyeing_lr": "Dyeing LR",
+    "dyeing_a_unit": "Dyeing A (Electrical) Unit",
+    "dyeing_a_total_ampere": "Dyeing A (Electrical) Total Ampere",
+    "dyeing_b_unit": "Dyeing B (Electrical) Unit",
+    "dyeing_b_total_ampere": "Dyeing B (Electrical) Total Ampere",
+    "thermopack_hour": "Thermopack Hour",
+    "thermopack_conv": "Thermopack Conv",
+    "thermopack_percentage": "Thermopack Percentage",
+    "electrical_unit": "Electrical Unit",
+    "electrical_per_hour_avg": "Electrical Per Hour Avg",
+    "electrical_total_ampere": "Electrical Total Ampere",
+    "stenmech_hours": "Stenmech Hours",
+    "stenmech_unit": "Stenmech Unit",
+    "stenmech_prod": "Stenmech Prod",
+    "stenmech_avg_prod": "Stenmech Avg Prod",
+    "stenmech_per_hour_avg": "Stenmech Per Hour Avg",
+    "lucy_hours": "Lucy Hours",
+    "lucy_unit": "Lucy Unit",
+    "lucy_prod": "Lucy Prod",
+    "lucy_avg_prod": "Lucy Avg Prod",
+    "lucy_avg_per_hour": "Lucy Avg Per Hour",
+    "harish_hours": "Harish Hours",
+    "harish_unit": "Harish Unit",
+    "harish_prod": "Harish Prod",
+    "harish_avg_prod": "Harish Avg Prod",
+    "harish_per_hour_avg": "Harish Per Hour Avg",
+    "compressor_hour": "Compressor Hour",
+    "compressor_unit": "Compressor Unit",
+    "compressor_per_hour_avg": "Compressor Per Hour Avg",
+    "compressor_total_ampere": "Compressor Total Ampere",
+    "summersible_hour": "Summersible Hour",
+    "summersible_unit": "Summersible Unit",
+    "summersible_per_hour_avg": "Summersible Per Hour Avg",
+    "summersible_total_ampere": "Summersible Total Ampere",
+})
+
+# Verified exact Zoho API link names — confirmed live against the "All_Tests"
+# report on 2026-11-11 (3 sample records). Zoho's naming turned out NOT to
+# match the form labels 1:1 in a couple of spots:
+#   • "Lucy" fields are actually spelled "Lucky" in the API (Hours/Unit/Prod/
+#     Avg Per Hour) — except Avg Prod, which really is "Lucy_Avg_Prod".
+#   • Dyeing A's Unit field is just "Dyeing_A_Electrical" (no "_Unit" suffix),
+#     unlike Dyeing B which does have "Dyeing_B_Electrical_Unit".
+#   • The date field's link name is "Date_field", not "Date".
+# These are tried FIRST (exact key lookup); fuzzy label-matching (below) is
+# only a fallback for anything not in this table, in case the schema changes.
+FACTORY_FIELD_LINKNAMES = {
+    "date": "Date_field",
+    "boiler_hour": "Bolier_Hour",
+    "boiler_conv": "Bolier_Conv",
+    "boiler_percentage": "Bolier_Percentage",
+    "boiler_water": "Bolier_Water",
+    "boiler_elec_unit": "Bolier_Electrical_Unit",
+    "boiler_elec_per_hour_avg": "Bolier_Electrical_Per_Hour_Avg",
+    "boiler_elec_total_ampere": "Bolier_Electrical_Total_Ampere",
+    "dyeing_prod": "Dyeing_Prod",
+    "dyeing_lot": "Dyeing_Lot",
+    "dyeing_water": "Dyeing_Water",
+    "dyeing_lr": "Dyeing_LR",
+    "dyeing_a_unit": "Dyeing_A_Electrical",
+    "dyeing_a_total_ampere": "Dyeing_A_Electrical_Total_Ampere",
+    "dyeing_b_unit": "Dyeing_B_Electrical_Unit",
+    "dyeing_b_total_ampere": "Dyeing_B_Electrical_Total_Ampere",
+    "thermopack_hour": "Thermopack_Hour",
+    "thermopack_conv": "Thermopack_Conv",
+    "thermopack_percentage": "Thermopack_Percentage",
+    "electrical_unit": "Electrical_Unit",
+    "electrical_per_hour_avg": "Electrical_Per_Hour_Avg",
+    "electrical_total_ampere": "Electrical_Total_Ampere",
+    "stenmech_hours": "Stenmech_Hours",
+    "stenmech_unit": "Stenmech_Unit",
+    "stenmech_prod": "Stenmech_Prod",
+    "stenmech_avg_prod": "Stenmech_Avg_Prod",
+    "stenmech_per_hour_avg": "Stenmech_Per_Hour_Avg",
+    "lucy_hours": "Lucky_Hours",
+    "lucy_unit": "Lucky_Unit",
+    "lucy_prod": "Lucky_Prod",
+    "lucy_avg_prod": "Lucy_Avg_Prod",
+    "lucy_avg_per_hour": "Lucky_Avg_Per_Hour",
+    "harish_hours": "Harish_Hours",
+    "harish_unit": "Harish_Unit",
+    "harish_prod": "Harish_Prod",
+    "harish_avg_prod": "Harish_Avg_Prod",
+    "harish_per_hour_avg": "Harish_Per_Hour_Avg",
+    "compressor_hour": "Compressor_Hour",
+    "compressor_unit": "Compressor_Unit",
+    "compressor_per_hour_avg": "Compressor_Per_Hour_Avg",
+    "compressor_total_ampere": "Compressor_Total_Ampere",
+    "summersible_hour": "Summersible_Hour",
+    "summersible_unit": "Summersible_Unit",
+    "summersible_per_hour_avg": "Summersible_Per_Hour_Avg",
+    "summersible_total_ampere": "Summersible_Total_Ampere",
+}
+
+
+def _norm_key(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+@st.cache_data(ttl=900, show_spinner="Loading Factory Sheet data…")
+def load_factory_sheet_data():
+    """Fetch the Factory Sheet report (Boiler/Dyeing/Stenter/Compressor/
+    Summersible) and resolve every expected field by fuzzy name-match against
+    whatever Zoho actually returns. Returns (df, diag)."""
+    cfg    = st.secrets["zoho_creator"]
+    owner  = cfg.get("factory_account_owner", "founder_in0")
+    app    = cfg.get("factory_app_name", "data-analytics")
+    report = cfg.get("factory_report_name", "All_Tests")
+    token  = get_access_token()
+
+    base_url = f"https://creator.zoho.in/api/v2/{owner}/{app}/report/{report}"
+    headers  = {"Authorization": f"Zoho-oauthtoken {token}"}
+
+    all_records = []
+    start, limit = 0, 200
+    try:
+        while True:
+            resp = requests.get(base_url, headers=headers,
+                                 params={"from": start, "limit": limit, "field_config": "all"},
+                                 timeout=20)
+            if resp.status_code != 200:
+                return pd.DataFrame(), {"error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+                                         "raw_fields": [], "unresolved": [], "records": 0}
+            recs = resp.json().get("data", [])
+            if not recs:
+                break
+            all_records.extend(recs)
+            if len(recs) < limit:
+                break
+            start += limit
+    except Exception as e:
+        return pd.DataFrame(), {"error": str(e), "raw_fields": [], "unresolved": [], "records": 0}
+
+    if not all_records:
+        return pd.DataFrame(), {"error": None, "raw_fields": [], "unresolved": [], "records": 0}
+
+    sample = all_records[0]
+    raw_keys = [k for k in sample.keys() if k not in ("ID", "id")]
+    norm_to_actual = {}
+    for k in raw_keys:
+        norm_to_actual.setdefault(_norm_key(k), k)
+
+    def _resolve(label):
+        target = _norm_key(label)
+        actual = norm_to_actual.get(target)
+        if actual is None and "bolier" in target:
+            actual = norm_to_actual.get(target.replace("bolier", "boiler"))
+        if actual is None and "boiler" in target:
+            actual = norm_to_actual.get(target.replace("boiler", "bolier"))
+        if actual is None and "summersible" in target:
+            actual = norm_to_actual.get(target.replace("summersible", "submersible"))
+        if actual is None and "submersible" in target:
+            actual = norm_to_actual.get(target.replace("submersible", "summersible"))
+        return actual
+
+    raw_key_set = set(raw_keys)
+    resolved = {}
+    unresolved = []
+    for logical_key, label in FACTORY_FIELD_LABELS.items():
+        # 1) verified exact link name (confirmed live against the report) wins
+        verified = FACTORY_FIELD_LINKNAMES.get(logical_key)
+        actual = verified if verified in raw_key_set else None
+        # 2) fall back to fuzzy label-matching if the verified name isn't present
+        #    (schema may have changed, or we're pointed at a different report)
+        if actual is None:
+            actual = _resolve(label)
+        resolved[logical_key] = actual
+        if actual is None:
+            unresolved.append((logical_key, label))
+
+    date_key = resolved.get("date")
+    rows = []
+    for rec in all_records:
+        row = {"Date": dv(rec.get(date_key)) if date_key else None}
+        for logical_key, actual in resolved.items():
+            if logical_key == "date":
+                continue
+            row[logical_key] = _to_num(dv(rec.get(actual))) if actual else 0.0
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df["Date"] = parse_dates(df["Date"])
+    diag = {"error": None, "raw_fields": raw_keys, "unresolved": unresolved, "records": len(all_records)}
+    return df, diag
+
+
+def build_factory_group_table(df, month_start, month_end, blocks):
+    """Returns (grid, aggs): grid is a DataFrame indexed 1..days_in_month with
+    MultiIndex columns (equipment_label, column_label); aggs maps each column
+    to its aggregation type ("sum" or "avg"), used again for the TOTAL row."""
+    days_in_month = (month_end - month_start).days + 1
+    scope = df[(df["Date"] >= month_start) & (df["Date"] <= month_end)].copy()
+    if not scope.empty:
+        scope["Day"] = scope["Date"].dt.day
+
+    grid = pd.DataFrame(index=range(1, days_in_month + 1))
+    aggs = {}
+    for equip_label, cols in blocks:
+        for logical_key, col_label, agg in cols:
+            col = (equip_label, col_label)
+            if scope.empty or logical_key not in scope.columns:
+                series = pd.Series(0.0, index=range(1, days_in_month + 1))
+            else:
+                grouped = scope.groupby("Day")[logical_key].sum() if agg == "sum" \
+                    else scope.groupby("Day")[logical_key].mean()
+                series = grouped.reindex(range(1, days_in_month + 1), fill_value=0.0)
+            grid[col] = series
+            aggs[col] = agg
+    grid.columns = pd.MultiIndex.from_tuples(grid.columns)
+    return grid, aggs
+
+
+def _factory_total_row(grid, aggs):
+    """TOTAL row values: sum of the day values for 'sum' columns, mean of the
+    non-zero day values for 'avg' columns (matching how these paper registers
+    treat a computed ratio column differently from a raw counter column)."""
+    out = {}
+    for c in grid.columns:
+        if aggs[c] == "sum":
+            out[c] = float(grid[c].sum())
+        else:
+            nz = grid[c][grid[c] != 0]
+            out[c] = float(nz.mean()) if len(nz) else 0.0
+    return out
+
+
+def _factory_fmt_cell(v):
+    try:
+        v = float(v)
+    except Exception:
+        return "—"
+    if v == 0:
+        return "—"
+    return f"{v:,.0f}" if abs(v - round(v)) < 1e-9 else f"{v:,.2f}"
+
+
+def render_factory_group_html(grid, aggs):
+    equip_spans = []
+    for c in grid.columns:
+        if not equip_spans or equip_spans[-1][0] != c[0]:
+            equip_spans.append([c[0], 1])
+        else:
+            equip_spans[-1][1] += 1
+
+    top_header = "<th>DAY</th>" + "".join(f"<th colspan='{span}'>{label}</th>" for label, span in equip_spans)
+    sub_header = "<th></th>" + "".join(f"<th>{c[1]}</th>" for c in grid.columns)
+
+    rows_html = ""
+    for day, row in grid.iterrows():
+        cells = "".join(f"<td>{_factory_fmt_cell(row[c])}</td>" for c in grid.columns)
+        rows_html += f"<tr><td><b>{day}</b></td>{cells}</tr>"
+
+    totals = _factory_total_row(grid, aggs)
+    total_cells = "".join(f"<td><b>{_factory_fmt_cell(totals[c])}</b></td>" for c in grid.columns)
+
+    st.markdown(f"""<div style="overflow-x:auto;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:20px;">
+      <table class="prod-sheet-table"><thead><tr>{top_header}</tr><tr>{sub_header}</tr></thead>
+      <tbody>{rows_html}<tr class="prod-sheet-total"><td><b>TOTAL</b></td>{total_cells}</tr></tbody></table></div>""",
+      unsafe_allow_html=True)
+
+
+def build_factory_excel(grids_dict, month_label):
+    """grids_dict: {sheet_title: (grid, aggs)} — one sheet per selected report."""
+    wb = Workbook()
+    wb.remove(wb.active)
+    navy_fill   = PatternFill("solid", fgColor="1E3A5F")
+    yellow_fill = PatternFill("solid", fgColor="FFFF00")
+    white_bold  = Font(color="FFFFFF", bold=True)
+    bold        = Font(bold=True)
+    thin   = Side(style="thin", color="D9D9D9")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+
+    for sheet_title, (grid, aggs) in grids_dict.items():
+        safe_title = re.sub(r"[^\w\s-]", "", sheet_title).strip()[:31] or "Sheet"
+        ws = wb.create_sheet(title=safe_title)
+        n_cols = len(grid.columns) + 1
+
+        ws.cell(row=1, column=1, value=f"{sheet_title.upper()} — {month_label}").font = Font(bold=True, size=13)
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+
+        equip_spans = []
+        for c in grid.columns:
+            if not equip_spans or equip_spans[-1][0] != c[0]:
+                equip_spans.append([c[0], 1])
+            else:
+                equip_spans[-1][1] += 1
+
+        r = 2
+        ws.cell(row=r, column=1).fill = navy_fill
+        ws.cell(row=r, column=1).border = border
+        col_idx = 2
+        for label, span in equip_spans:
+            ws.cell(row=r, column=col_idx, value=label)
+            if span > 1:
+                ws.merge_cells(start_row=r, start_column=col_idx, end_row=r, end_column=col_idx + span - 1)
+            for cc in range(col_idx, col_idx + span):
+                cell = ws.cell(row=r, column=cc)
+                cell.fill = navy_fill; cell.font = white_bold; cell.alignment = center; cell.border = border
+            col_idx += span
+
+        r += 1
+        header_row = r
+        ws.cell(row=r, column=1, value="DAY")
+        for i, c in enumerate(grid.columns, start=2):
+            ws.cell(row=r, column=i, value=c[1])
+        for cc in range(1, n_cols + 1):
+            cell = ws.cell(row=r, column=cc)
+            cell.fill = navy_fill; cell.font = white_bold; cell.alignment = center; cell.border = border
+
+        r += 1
+        for day, row_vals in grid.iterrows():
+            ws.cell(row=r, column=1, value=day).font = bold
+            for i, c in enumerate(grid.columns, start=2):
+                ws.cell(row=r, column=i, value=round(float(row_vals[c]), 2))
+            for cc in range(1, n_cols + 1):
+                ws.cell(row=r, column=cc).border = border
+                ws.cell(row=r, column=cc).alignment = center
+            r += 1
+
+        totals = _factory_total_row(grid, aggs)
+        ws.cell(row=r, column=1, value="TOTAL").font = bold
+        ws.cell(row=r, column=1).fill = yellow_fill
+        for i, c in enumerate(grid.columns, start=2):
+            cell = ws.cell(row=r, column=i, value=round(totals[c], 2))
+            cell.fill = yellow_fill; cell.font = bold
+        for cc in range(1, n_cols + 1):
+            ws.cell(row=r, column=cc).border = border
+            ws.cell(row=r, column=cc).alignment = center
+
+        ws.column_dimensions["A"].width = 8
+        for cc in range(2, n_cols + 1):
+            ws.column_dimensions[get_column_letter(cc)].width = 13
+        ws.freeze_panes = ws.cell(row=header_row + 1, column=2)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def render_factory_sheet_view():
+    section_header("🏭", "Factory Sheets", "Boiler · Dyeing · Stenter · Compressor · Summersible — day-wise, from Zoho")
+
+    fdf, fdiag = load_factory_sheet_data()
+    if fdiag.get("error"):
+        st.error(f"❌ Could not load the Factory Sheet report: `{fdiag['error']}`")
+        st.info("""
+**Setup checklist:**
+1. Confirm `factory_account_owner` / `factory_app_name` / `factory_report_name` under `[zoho_creator]`
+   in `secrets.toml` (defaults assumed: `founder_in0` / `data-analytics` / `All_Tests`).
+2. Make sure that report is not IP-restricted in Zoho Creator.
+3. Make sure the same OAuth client/refresh token has access to that app too.
+        """)
+        return
+
+    if fdf.empty:
+        st.warning("⚠️ No records found in the Factory Sheet report."); return
+
+    fdf = fdf.dropna(subset=["Date"])
+    if fdf.empty:
+        st.info("No dated records in the Factory Sheet report."); return
+
+    months = sorted(fdf["Date"].dt.to_period("M").unique(), reverse=True)
+    month_labels = {m: m.strftime("%B %Y") for m in months}
+
+    fc1, fc2 = st.columns([2, 4])
+    with fc1:
+        sel_month = st.selectbox("📆 Month", months, format_func=lambda m: month_labels[m], key="factory_month")
+    month_start = sel_month.to_timestamp()
+    month_end = month_start + pd.offsets.MonthEnd(0)
+
+    group_options = {v["title"]: k for k, v in FACTORY_REPORT_GROUPS.items()}
+    with fc2:
+        sel_titles = st.multiselect("📋 Reports to show (pick any / all)", list(group_options.keys()),
+            default=list(group_options.keys()), key="factory_reports_sel")
+
+    if not sel_titles:
+        st.info("Select at least one report above to view it."); return
+
+    grids = {}
+    for title in sel_titles:
+        gkey = group_options[title]
+        blocks = FACTORY_REPORT_GROUPS[gkey]["blocks"]
+        grid, aggs = build_factory_group_table(fdf, month_start, month_end, blocks)
+        grids[title] = (grid, aggs)
+        section_divider(f"{title} — {month_labels[sel_month]}")
+        render_factory_group_html(grid, aggs)
+
+    xlsx_bytes = build_factory_excel(grids, month_labels[sel_month])
+    st.download_button(
+        "⬇️ Download Factory Sheets as Excel (selected reports)",
+        data=xlsx_bytes,
+        file_name=f"factory_sheets_{sel_month.strftime('%Y_%m')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="dl_factory_sheets",
+    )
+
+
 def subset_sub(parent_df, sub_df):
     """Filter a sub-form frame down to the parent rows currently in scope."""
     if sub_df is None or sub_df.empty or "_id" not in parent_df.columns:
@@ -1548,7 +2086,7 @@ all_biztypes = sorted(raw["Business Type"].dropna().unique())
 # button click) so the filter bar can hide fields that don't apply to
 # Inward/Outward (which only has Date + Party — no Quality/Shade/Master/Business Type).
 _view_for_filters = st.session_state.get("view", "month")
-is_io_view = (_view_for_filters == "io")
+is_io_view = (_view_for_filters in ("io", "factory"))
 
 with st.expander("🔍  Filters — click to expand", expanded=False):
     st.markdown("<div class='filter-bar-title'>Filter the data below</div>", unsafe_allow_html=True)
@@ -1632,7 +2170,7 @@ df_dye  = subset_sub(df, raw_dye)
 # VIEW TOGGLE
 # ─────────────────────────────────────────────
 st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-vt_col1, vt_col2, vt_col3, vt_col4, vt_spacer = st.columns([1, 1, 1, 1, 3])
+vt_col1, vt_col2, vt_col3, vt_col4, vt_col5, vt_spacer = st.columns([1, 1, 1, 1, 1, 2])
 with vt_col1:
     day_btn = st.button("📅  Day Wise", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "day" else "secondary")
@@ -1645,6 +2183,9 @@ with vt_col3:
 with vt_col4:
     io_btn = st.button("📦  Inward/Outward", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "io" else "secondary")
+with vt_col5:
+    factory_btn = st.button("🏭  Factory Sheets", use_container_width=True,
+        type="primary" if st.session_state.get("view", "month") == "factory" else "secondary")
 if day_btn:
     st.session_state["view"] = "day"
     st.rerun()
@@ -1656,6 +2197,9 @@ if ledger_btn:
     st.rerun()
 if io_btn:
     st.session_state["view"] = "io"
+    st.rerun()
+if factory_btn:
+    st.session_state["view"] = "factory"
     st.rerun()
 current_view = st.session_state.get("view", "month")
 st.divider()
@@ -2937,6 +3481,8 @@ elif current_view == "ledger":
     render_party_ledger_report(ledger_df, ledger_chem, ledger_dye, l_from, l_to)
 elif current_view == "io":
     render_inward_outward_view()
+elif current_view == "factory":
+    render_factory_sheet_view()
 
 
 # ─────────────────────────────────────────────
