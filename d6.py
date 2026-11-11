@@ -2118,8 +2118,56 @@ def _electrical_total_row(grid, kinds):
     return out
 
 
+def render_electrical_view():
+    section_header("⚡", "Electrical", "LS Meter · LS Energy Meter · MDI · Colony · Solar · Drain Water — day-wise, from Zoho")
+
+    edf, ediag = load_electrical_data()
+    if ediag.get("error"):
+        st.error(f"❌ Could not load the Electrical report: `{ediag['error']}`")
+        st.info("""
+**Setup checklist:**
+1. Confirm `factory_account_owner` / `factory_app_name` / `electrical_report_name` under `[zoho_creator]`
+   in `secrets.toml` (defaults assumed: `founder_in0` / `data-analytics` / `Electrical_Report`).
+2. Make sure that report is not IP-restricted in Zoho Creator.
+3. Make sure the same OAuth client/refresh token has access to that app too.
+        """)
+        return
+
+    if edf.empty:
+        st.warning("⚠️ No records found in the Electrical report."); return
+
+    edf_dated = edf.dropna(subset=["Date"])
+    if edf_dated.empty:
+        st.info("No dated records in the Electrical report."); return
+
+    months = sorted(edf_dated["Date"].dt.to_period("M").unique(), reverse=True)
+    month_labels = {m: m.strftime("%B %Y") for m in months}
+
+    sel_month = st.selectbox("📆 Month", months, format_func=lambda m: month_labels[m], key="electrical_month")
+    month_start = sel_month.to_timestamp()
+    month_end = month_start + pd.offsets.MonthEnd(0)
+
+    # Pass the FULL history (not month-scoped) so day 1 of the month can diff
+    # against the prior month's last reading rather than showing a false blank.
+    grid, kinds = build_electrical_grid(edf, month_start, month_end)
+    totals = _electrical_total_row(grid, kinds)
+
+    section_divider(f"Electrical — {month_labels[sel_month]}")
+    render_factory_group_html(grid, totals)
+
+    xlsx_bytes = build_factory_excel({"Electrical": (grid, totals)}, month_labels[sel_month])
+    st.download_button(
+        "⬇️ Download Electrical as Excel",
+        data=xlsx_bytes,
+        file_name=f"electrical_{sel_month.strftime('%Y_%m')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="dl_electrical",
+    )
+
+
 def render_factory_sheet_view():
-    section_header("🏭", "Factory Sheets", "Boiler · Dyeing · Stenter · Compressor · Summersible · Electrical — day-wise, from Zoho")
+    section_header("🏭", "Factory Sheets", "Boiler · Dyeing · Stenter · Compressor · Summersible — day-wise, from Zoho")
 
     fdf, fdiag = load_factory_sheet_data()
     if fdiag.get("error"):
@@ -2140,15 +2188,7 @@ def render_factory_sheet_view():
     if fdf.empty:
         st.info("No dated records in the Factory Sheet report."); return
 
-    # Electrical lives in its own Zoho report — load it leniently so a problem
-    # there doesn't take down the other 3 reports.
-    edf, ediag = load_electrical_data()
-    electrical_ok = not ediag.get("error") and not edf.empty
-    if ediag.get("error"):
-        st.caption(f"⚡ Electrical report unavailable right now ({ediag['error']}) — other reports below are unaffected.")
-
-    all_dates = fdf["Date"] if not electrical_ok else pd.concat([fdf["Date"], edf.dropna(subset=["Date"])["Date"]])
-    months = sorted(all_dates.dt.to_period("M").unique(), reverse=True)
+    months = sorted(fdf["Date"].dt.to_period("M").unique(), reverse=True)
     month_labels = {m: m.strftime("%B %Y") for m in months}
 
     fc1, fc2 = st.columns([2, 4])
@@ -2158,8 +2198,6 @@ def render_factory_sheet_view():
     month_end = month_start + pd.offsets.MonthEnd(0)
 
     group_options = {v["title"]: k for k, v in FACTORY_REPORT_GROUPS.items()}
-    if electrical_ok:
-        group_options[ELECTRICAL_GROUP_TITLE] = ELECTRICAL_GROUP_KEY
     with fc2:
         sel_titles = st.multiselect("📋 Reports to show (pick any / all)", list(group_options.keys()),
             default=list(group_options.keys()), key="factory_reports_sel")
@@ -2170,13 +2208,9 @@ def render_factory_sheet_view():
     grids = {}
     for title in sel_titles:
         gkey = group_options[title]
-        if gkey == ELECTRICAL_GROUP_KEY:
-            grid, kinds = build_electrical_grid(edf, month_start, month_end)
-            totals = _electrical_total_row(grid, kinds)
-        else:
-            blocks = FACTORY_REPORT_GROUPS[gkey]["blocks"]
-            grid, aggs = build_factory_group_table(fdf, month_start, month_end, blocks)
-            totals = _factory_total_row(grid, aggs)
+        blocks = FACTORY_REPORT_GROUPS[gkey]["blocks"]
+        grid, aggs = build_factory_group_table(fdf, month_start, month_end, blocks)
+        totals = _factory_total_row(grid, aggs)
         grids[title] = (grid, totals)
         section_divider(f"{title} — {month_labels[sel_month]}")
         render_factory_group_html(grid, totals)
@@ -2300,7 +2334,7 @@ all_biztypes = sorted(raw["Business Type"].dropna().unique())
 # button click) so the filter bar can hide fields that don't apply to
 # Inward/Outward (which only has Date + Party — no Quality/Shade/Master/Business Type).
 _view_for_filters = st.session_state.get("view", "month")
-is_io_view = (_view_for_filters in ("io", "factory"))
+is_io_view = (_view_for_filters in ("io", "factory", "electrical"))
 
 with st.expander("🔍  Filters — click to expand", expanded=False):
     st.markdown("<div class='filter-bar-title'>Filter the data below</div>", unsafe_allow_html=True)
@@ -2384,7 +2418,7 @@ df_dye  = subset_sub(df, raw_dye)
 # VIEW TOGGLE
 # ─────────────────────────────────────────────
 st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-vt_col1, vt_col2, vt_col3, vt_col4, vt_col5, vt_spacer = st.columns([1, 1, 1, 1, 1, 2])
+vt_col1, vt_col2, vt_col3, vt_col4, vt_col5, vt_col6, vt_spacer = st.columns([1, 1, 1, 1, 1, 1, 1])
 with vt_col1:
     day_btn = st.button("📅  Day Wise", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "day" else "secondary")
@@ -2400,6 +2434,9 @@ with vt_col4:
 with vt_col5:
     factory_btn = st.button("🏭  Factory Sheets", use_container_width=True,
         type="primary" if st.session_state.get("view", "month") == "factory" else "secondary")
+with vt_col6:
+    electrical_btn = st.button("⚡  Electrical", use_container_width=True,
+        type="primary" if st.session_state.get("view", "month") == "electrical" else "secondary")
 if day_btn:
     st.session_state["view"] = "day"
     st.rerun()
@@ -2414,6 +2451,9 @@ if io_btn:
     st.rerun()
 if factory_btn:
     st.session_state["view"] = "factory"
+    st.rerun()
+if electrical_btn:
+    st.session_state["view"] = "electrical"
     st.rerun()
 current_view = st.session_state.get("view", "month")
 st.divider()
@@ -3697,6 +3737,8 @@ elif current_view == "io":
     render_inward_outward_view()
 elif current_view == "factory":
     render_factory_sheet_view()
+elif current_view == "electrical":
+    render_electrical_view()
 
 
 # ─────────────────────────────────────────────
