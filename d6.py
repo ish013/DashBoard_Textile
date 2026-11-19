@@ -2418,30 +2418,29 @@ df_dye  = subset_sub(df, raw_dye)
 # VIEW TOGGLE
 # ─────────────────────────────────────────────
 st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-vt_col1, vt_col2, vt_col3, vt_col4, vt_col5, vt_col6, vt_spacer = st.columns([1, 1, 1, 1, 1, 1, 1])
+_cur_view = st.session_state.get("view", "month")
+_is_production = _cur_view in ("day", "month")
+
+# Top-level tabs: Production · Party Ledger · Inward/Outward · Factory Sheets · Electrical
+vt_col1, vt_col2, vt_col3, vt_col4, vt_col5, vt_spacer = st.columns([1, 1, 1, 1, 1, 2])
 with vt_col1:
-    day_btn = st.button("📅  Day Wise", use_container_width=True,
-        type="primary" if st.session_state.get("view", "month") == "day" else "secondary")
+    prod_btn = st.button("🏭  Production", use_container_width=True,
+        type="primary" if _is_production else "secondary")
 with vt_col2:
-    month_btn = st.button("📆  Month Wise", use_container_width=True,
-        type="primary" if st.session_state.get("view", "month") == "month" else "secondary")
-with vt_col3:
     ledger_btn = st.button("🧾  Party Ledger", use_container_width=True,
-        type="primary" if st.session_state.get("view", "month") == "ledger" else "secondary")
-with vt_col4:
+        type="primary" if _cur_view == "ledger" else "secondary")
+with vt_col3:
     io_btn = st.button("📦  Inward/Outward", use_container_width=True,
-        type="primary" if st.session_state.get("view", "month") == "io" else "secondary")
+        type="primary" if _cur_view == "io" else "secondary")
+with vt_col4:
+    factory_btn = st.button("🏗️  Factory Sheets", use_container_width=True,
+        type="primary" if _cur_view == "factory" else "secondary")
 with vt_col5:
-    factory_btn = st.button("🏭  Factory Sheets", use_container_width=True,
-        type="primary" if st.session_state.get("view", "month") == "factory" else "secondary")
-with vt_col6:
     electrical_btn = st.button("⚡  Electrical", use_container_width=True,
-        type="primary" if st.session_state.get("view", "month") == "electrical" else "secondary")
-if day_btn:
-    st.session_state["view"] = "day"
-    st.rerun()
-if month_btn:
-    st.session_state["view"] = "month"
+        type="primary" if _cur_view == "electrical" else "secondary")
+if prod_btn:
+    # reopen whichever Production sub-tab was used last (default: Month Wise)
+    st.session_state["view"] = st.session_state.get("prod_subview", "month")
     st.rerun()
 if ledger_btn:
     st.session_state["view"] = "ledger"
@@ -2455,6 +2454,25 @@ if factory_btn:
 if electrical_btn:
     st.session_state["view"] = "electrical"
     st.rerun()
+
+# Production sub-tabs: Day Wise / Month Wise (only shown inside Production)
+if _is_production:
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+    sub_col1, sub_col2, sub_spacer = st.columns([1, 1, 5])
+    with sub_col1:
+        day_btn = st.button("📅  Day Wise", use_container_width=True, key="sub_day",
+            type="primary" if _cur_view == "day" else "secondary")
+    with sub_col2:
+        month_btn = st.button("📆  Month Wise", use_container_width=True, key="sub_month",
+            type="primary" if _cur_view == "month" else "secondary")
+    if day_btn:
+        st.session_state["view"] = "day"
+        st.session_state["prod_subview"] = "day"
+        st.rerun()
+    if month_btn:
+        st.session_state["view"] = "month"
+        st.session_state["prod_subview"] = "month"
+        st.rerun()
 current_view = st.session_state.get("view", "month")
 st.divider()
 
