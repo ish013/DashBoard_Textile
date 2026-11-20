@@ -1449,13 +1449,13 @@ def render_inward_outward_view():
 # Dyeing Data Analysis, Stenter Data Analysis, Compressor, Summersible —
 # each with the same 2-row grouped header style as the paper sheet.
 #
-# Lives in a separate Zoho Creator report ("All_Tests" in the "data-analytics"
+# Lives in a separate Zoho Creator report ("Overall_Report" in the "data-analytics"
 # app, per the client's URL) — NOT the same report as Production Entry.
 # Override the owner/app/report via secrets.toml if these ever change:
 #   [zoho_creator]
 #   factory_account_owner = "founder_in0"
 #   factory_app_name      = "data-analytics"
-#   factory_report_name   = "All_Tests"
+#   factory_report_name   = "Overall_Report"
 #
 # Field-name matching: rather than hard-coding Zoho's internal API link names
 # (which we can't verify without live access to that report), every expected
@@ -1610,7 +1610,7 @@ FACTORY_FIELD_LABELS.update({
     "summersible_total_ampere": "Summersible Total Ampere",
 })
 
-# Verified exact Zoho API link names — confirmed live against the "All_Tests"
+# Verified exact Zoho API link names — confirmed live against the "Overall_Report"
 # report on 2026-11-11 (3 sample records). Zoho's naming turned out NOT to
 # match the form labels 1:1 in a couple of spots:
 #   • "Lucy" fields are actually spelled "Lucky" in the API (Hours/Unit/Prod/
@@ -1681,7 +1681,7 @@ def load_factory_sheet_data():
     cfg    = st.secrets["zoho_creator"]
     owner  = cfg.get("factory_account_owner", "founder_in0")
     app    = cfg.get("factory_app_name", "data-analytics")
-    report = cfg.get("factory_report_name", "All_Tests")
+    report = cfg.get("factory_report_name", "Overall_Report")
     token  = get_access_token()
 
     base_url = f"https://creator.zoho.in/api/v2/{owner}/{app}/report/{report}"
@@ -2175,7 +2175,7 @@ def render_factory_sheet_view():
         st.info("""
 **Setup checklist:**
 1. Confirm `factory_account_owner` / `factory_app_name` / `factory_report_name` under `[zoho_creator]`
-   in `secrets.toml` (defaults assumed: `founder_in0` / `data-analytics` / `All_Tests`).
+   in `secrets.toml` (defaults assumed: `founder_in0` / `data-analytics` / `Overall_Report`).
 2. Make sure that report is not IP-restricted in Zoho Creator.
 3. Make sure the same OAuth client/refresh token has access to that app too.
         """)
