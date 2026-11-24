@@ -2039,7 +2039,11 @@ def load_electrical_data():
         for logical_key, actual in resolved.items():
             if logical_key == "date":
                 continue
-            row[logical_key] = _to_num(dv(rec.get(actual))) if actual else None
+            # A meter reading of 0 / blank means "not entered that day" (Zoho stores
+            # skipped days as 0.00), NOT a real reading of zero — keep it as NaN so
+            # it doesn't create a huge negative/positive Unit when diffed.
+            val = _to_num(dv(rec.get(actual))) if actual else 0.0
+            row[logical_key] = val if val > 0 else None
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -2066,7 +2070,14 @@ def build_electrical_grid(edf, month_start, month_end):
         "drain_water_reading": "drainwater_unit",
     }
     for rcol, ucol in reading_to_unit.items():
-        edf[ucol] = edf[rcol].diff()
+        # Diff each meter against its LAST VALID reading (skipping days with no
+        # entry), so the next real entry absorbs the gap. A negative result means
+        # a typo or meter reset — blank it rather than show a bogus negative.
+        valid = pd.to_numeric(edf[rcol], errors="coerce")
+        valid = valid[valid > 0]
+        unit = valid.diff()
+        unit = unit.where(unit >= 0)
+        edf[ucol] = unit.reindex(edf.index)
 
     days_in_month = (month_end - month_start).days + 1
     scope = edf[(edf["Date"] >= month_start) & (edf["Date"] <= month_end)].copy()
